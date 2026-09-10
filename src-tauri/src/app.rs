@@ -11,7 +11,7 @@ pub struct AppState {
     pub engine: Mutex<Engine>,
 }
 
-fn wall_ms() -> u64 {
+pub(crate) fn wall_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -105,16 +105,25 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     // `bundle.icon` list (falling back to `icons/icon.png`/`icons/icon.ico` on
     // disk); it does not depend on `app.windows` being non-empty (that key
     // controls startup *windows*, not the icon bundle). Verified against the
-    // tauri-codegen source (`context.rs`): the icon lookup runs unconditionally.
-    // Even so, never unwrap something that is typed `Option` at a startup path:
-    // if it is ever `None` (a broken build, a missing icon file), log loudly and
-    // skip building the tray rather than panicking the whole app before it can
-    // do anything.
+    // tauri-codegen source (`context.rs`): the icon lookup runs unconditionally,
+    // so in this repo's config it always returns `Some`. Even so, never unwrap
+    // something that is typed `Option` at a startup path.
+    //
+    // If it were ever `None` (a broken build, a missing icon file), this is NOT
+    // a case to degrade gracefully into: this app has no window (`app.windows:
+    // []`) and no other UI, so a tray-less run is not a degraded app, it is an
+    // invisible, unkillable one -- `lib.rs`'s `run()` unconditionally swallows
+    // the exit that would otherwise fire when the (nonexistent) tray's Quit
+    // item can't be clicked. Exit loudly here instead, before the event loop
+    // (and that swallow) ever starts, so the two degradations can't compose.
     let icon = match app.default_window_icon().cloned() {
         Some(icon) => icon,
         None => {
-            log::error!("no default window icon available; refusing to unwrap, tray will be missing");
-            return Ok(());
+            log::error!(
+                "no default window icon available; a tray-less TwentyTwenty would be an \
+                 invisible process with no way to quit it, so exiting instead of starting"
+            );
+            std::process::exit(1);
         }
     };
 

@@ -9,10 +9,25 @@
     color: #f4f6fb;
     font: 400 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
     display: grid; place-items: center;
-    opacity: 0; transition: opacity 400ms ease;
     -webkit-user-select: none; user-select: none;
   }
-  body.visible { opacity: 1; }
+  /* Invisibility is a forbidden failure mode here: this is a fullscreen,
+     input-blocking window, so if it ever fails to render, it must fail
+     VISIBLE (an odd-looking but dismissible screen) rather than invisible
+     (an unexplained click/keyboard trap with nothing on screen -- exactly
+     what shipped originally, when `opacity: 0` was set on both `html` and
+     `body` and only `body` was ever restored to 1; opacity multiplies down
+     the render tree, so the effective opacity stayed 0 no matter what `body`
+     did). The fade-in is therefore a pure CSS animation on `body` alone,
+     with `html` left at its default opaque state as a backstop: it runs
+     whether or not any JavaScript ever executes, so a broken/slow script
+     still leaves a fully visible, dismissible overlay after 400ms.
+  */
+  body { animation: fade-in 400ms ease forwards; }
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
   .wrap { text-align: center; }
   .ring { width: 168px; height: 168px; margin: 0 auto 32px; }
   .ring circle { fill: none; stroke-width: 8; }
@@ -62,8 +77,6 @@
   // `remaining` value seen so far, which is the first tick of the break.
   let total = null;
   let last = null;
-
-  requestAnimationFrame(() => document.body.classList.add("visible"));
 
   listen("tt://tick", (e) => {
     const remaining = e.payload;

@@ -28,6 +28,19 @@ pub fn show(handle: &AppHandle) {
             .title("TwentyTwenty")
             .decorations(false)
             .always_on_top(true)
+            // KNOWN PLATFORM LIMITATION, confirmed by a user report on this
+            // exact machine (KDE Plasma 6.7.4, Wayland): the overlay still
+            // shows up as a taskbar entry despite this. Traced into `tao`
+            // (0.35.3, `platform_impl/linux/window.rs` and `event_loop.rs`):
+            // on Linux this hint is implemented as GTK's
+            // `set_skip_taskbar_hint`/`set_skip_pager_hint`, which are pure
+            // X11/EWMH (`_NET_WM_STATE_SKIP_TASKBAR`) calls under the hood --
+            // GTK's Wayland backend has no equivalent and silently no-ops
+            // them. Wayland's core protocol has no client-side "hide me from
+            // the taskbar" hint at all; that is deliberately the
+            // compositor's/shell's call, not a client's. Not fixable from
+            // here; tracked on the Task 16 smoke checklist as a known
+            // Wayland limitation rather than a bug to chase.
             .skip_taskbar(true)
             .transparent(true)
             .focused(i == 0)
