@@ -23,14 +23,18 @@
 //! shipping silently broken behavior (a wrong `true` would prevent the engine
 //! from ever accumulating screen time, undetectable without a Mac).
 //!
-//! A locked macOS session presents as climbing idle time with no active display
-//! assertions, which the engine already handles correctly by treating that state
-//! as time away. This differs from the Linux probe, which wires `LockedHint`
-//! because a standards-based, testable signal exists there (`logind` DBus API).
-//! On macOS, no equivalent cheap, safe, verified alternative is available, so
-//! `locked` is hardcoded `false`.
+//! Whether a locked macOS session preserves active display assertions is unknown.
+//! Assertions are process-scoped, so an app holding `PreventUserIdleDisplaySleep`
+//! before the lock has no obvious reason to release it after. This is the same
+//! false-positive class that motivated wiring `LockedHint` on Linux. A future
+//! maintainer with a Mac could settle this by locking the screen while a video
+//! call or screen share is active and comparing `pmset -g assertions` before
+//! and after. Until then, `locked` is hardcoded `false`. This differs from Linux,
+//! which wires `LockedHint` because a standards-based, testable signal exists
+//! there (`logind` DBus API). On macOS, no equivalent cheap, safe, verified
+//! alternative is available.
 
-use super::{ActivityProbe, Sample};
+use super::{parse_pmset_assertions, ActivityProbe, Sample};
 use core_graphics::event::CGEventType;
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use std::process::Command;
@@ -51,23 +55,25 @@ impl MacosProbe {
 
     /// Returns (display_held_awake, presenting). Shelling out to pmset is cheap
     /// at this cadence and far easier to reason about than IOKit FFI we cannot run.
+    /// A failed invocation degrades to (false, false).
     fn assertions(&mut self) -> (bool, bool) {
         if let Some((at, held, presenting)) = self.cached_assertions {
             if at.elapsed() < ASSERTION_POLL {
                 return (held, presenting);
             }
         }
-        let out = Command::new("pmset")
+
+        let (held, presenting) = Command::new("pmset")
             .args(["-g", "assertions"])
             .output()
             .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
-            .unwrap_or_default();
-
-        let held = out
-            .lines()
-            .any(|l| l.contains("preventuseridledisplaysleep") && !l.trim_start().starts_with('0'));
-        let presenting = out.contains("screen sharing") || out.contains("screencapture");
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|output| parse_pmset_assertions(&output))
+            // On pmset failure (not found, crashed, non-UTF8, etc.), degrade to
+            // false. This is the safe direction: a missing signal is better than
+            // a stuck-true assertion state. A real diagnostic would log the error
+            // here so the operator can investigate.
+            .unwrap_or((false, false));
 
         self.cached_assertions = Some((Instant::now(), held, presenting));
         (held, presenting)
