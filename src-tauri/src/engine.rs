@@ -72,8 +72,10 @@ impl Engine {
     }
 
     pub fn tick(&mut self, s: Sample, now_ms: u64, wall_ms: u64) -> Vec<Command> {
-        let step = self.advance_clock(now_ms, wall_ms);
-        let active = !s.locked && (s.idle_seconds < ACTIVE_GRACE_SECS || s.display_held_awake);
+        let (step, gapped) = self.advance_clock(now_ms, wall_ms);
+        let active = !gapped
+            && !s.locked
+            && (s.idle_seconds < ACTIVE_GRACE_SECS || s.display_held_awake);
         let mut cmds = Vec::new();
 
         match self.state {
@@ -233,14 +235,17 @@ impl Engine {
         }
     }
 
-    /// Returns how many seconds to advance. A gap larger than two ticks means
-    /// the machine slept or the loop stalled.
-    fn advance_clock(&mut self, now_ms: u64, wall_ms: u64) -> u64 {
+    /// Returns (seconds to advance, whether this was an abnormal gap).
+    /// A gap means the machine slept or the tick loop stalled; in both cases the
+    /// user was not at the screen, so the time is credited to the away timer.
+    fn advance_clock(&mut self, now_ms: u64, wall_ms: u64) -> (u64, bool) {
         let mono = self.last_mono_ms.map(|p| now_ms.saturating_sub(p)).unwrap_or(TICK_MS);
         let wall = self.last_wall_ms.map(|p| wall_ms.saturating_sub(p)).unwrap_or(TICK_MS);
         self.last_mono_ms = Some(now_ms);
         self.last_wall_ms = Some(wall_ms);
-        (mono.max(wall) / TICK_MS).max(1)
+        let elapsed = mono.max(wall);
+        let gapped = elapsed > 2 * TICK_MS;
+        ((elapsed / TICK_MS).max(1), gapped)
     }
 }
 
@@ -475,5 +480,34 @@ mod tests {
         let cmds = e.on_user(UserEvent::BreakNow, 0);
         assert!(cmds.contains(&Command::ShowOverlay));
         assert_eq!(e.state(), State::OnBreak);
+    }
+
+    #[test]
+    fn sleeping_the_machine_counts_as_a_break_not_screen_time() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), 600, 0);
+        assert_eq!(e.bank_secs(), 600);
+        // Monotonic time stalls during suspend; wall clock jumps an hour.
+        let mono = t + TICK_MS;
+        let wall = t + 3_600 * TICK_MS;
+        e.tick(typing(), mono, wall);
+        assert_eq!(e.bank_secs(), 0, "an hour asleep is a break");
+    }
+
+    #[test]
+    fn a_stalled_loop_does_not_inflate_the_bank() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), 60, 0);
+        // Both clocks jump: the loop was starved, the user was not at the screen.
+        let j = t + 300 * TICK_MS;
+        e.tick(typing(), j, j);
+        assert_eq!(e.bank_secs(), 0);
+    }
+
+    #[test]
+    fn an_ordinary_tick_is_never_treated_as_a_gap() {
+        let mut e = Engine::new();
+        run(&mut e, typing(), 120, 0);
+        assert_eq!(e.bank_secs(), 120);
     }
 }
