@@ -243,16 +243,17 @@ impl LinuxProbe {
     /// run from an agent-spawned shell) gets
     /// `org.freedesktop.login1.NoSessionForPID` even though the real KDE
     /// session is alive and correctly reports `LockedHint`. A shipped app
-    /// autostarted as a systemd user service would hit the same failure for
-    /// the same reason (it isn't a member of the session's cgroup either).
-    /// So: try `GetSessionByPID` first (the precise, correct answer when it
-    /// resolves), and fall back to the one session with a non-empty seat id
-    /// from `ListSessions` (the graphical seat0 session, as opposed to the
-    /// seat-less background session `ListSessions` also returned on this
-    /// machine for the same user). Any failure anywhere in this chain
-    /// degrades to `Err`, and the caller in `sample()` folds that to
-    /// `false` -- the same value this probe already reported before
-    /// `LockedHint` was wired in, so there is no regression risk.
+    /// autostarted as a systemd user service hits the same failure for the
+    /// same reason (it isn't a member of the session's cgroup either) --
+    /// which means the `ListSessions` fallback below is not a rare corner
+    /// case, it is the path production actually takes. So: try
+    /// `GetSessionByPID` first (the precise, correct answer when it
+    /// resolves), and fall back to `ListSessions`, filtered and
+    /// disambiguated per the hazard documented on `resolve_login1_session`.
+    /// Any failure anywhere in this chain degrades to `Err`, and the caller
+    /// in `sample()` folds that to `false` -- the same value this probe
+    /// already reported before `LockedHint` was wired in, so there is no
+    /// regression risk.
     fn login1_locked_hint(&self) -> Result<bool> {
         let system = self
             .system_dbus
@@ -281,6 +282,26 @@ impl LinuxProbe {
             .context("reading LockedHint")
     }
 
+    /// Resolves the login1 session object path whose `LockedHint` this
+    /// process should read.
+    ///
+    /// HAZARD, and why the uid filter below is load-bearing, not
+    /// decoration: this is the probe's *normal* path in production (see
+    /// `login1_locked_hint`'s doc comment -- `GetSessionByPID` fails for
+    /// any process outside the session's cgroup, which includes a
+    /// systemd-user-service autostart). `ListSessions` returns every
+    /// session on the machine, for every user. On a single-user machine the
+    /// first seated row happens to be the right one, but on a machine with
+    /// two graphical sessions belonging to different users (fast user
+    /// switching, or a second seat), picking "the first seated row" can
+    /// resolve to a DIFFERENT user's session and read THEIR lock state.
+    /// That is worse than reading none: it is confidently wrong, with
+    /// nothing downstream able to tell right from wrong. So candidates are
+    /// filtered to this process's own uid before anything else -- never
+    /// select a session this process's user does not own. If no seated
+    /// session for this uid exists, this returns `Err`, which
+    /// `login1_locked_hint` degrades to `false`, exactly like every other
+    /// failure on this path -- never a guess.
     fn resolve_login1_session(
         manager: &zbus::blocking::Proxy<'_>,
     ) -> Result<zbus::zvariant::OwnedObjectPath> {
@@ -290,6 +311,8 @@ impl LinuxProbe {
             return Ok(path);
         }
 
+        let uid = Self::current_uid()?;
+
         // `ListSessions` row shape: (session_id, uid, user_name, seat_id,
         // object_path). A seat-less row is a background/manager session, not
         // a graphical one -- confirmed live on this machine (session "3" had
@@ -298,11 +321,67 @@ impl LinuxProbe {
         let sessions: Vec<SessionRow> = manager
             .call("ListSessions", &())
             .context("listing login1 sessions")?;
-        sessions
+
+        let mut candidates: Vec<SessionRow> = sessions
             .into_iter()
-            .find(|(_, _, _, seat_id, _)| !seat_id.is_empty())
-            .map(|(_, _, _, _, path)| path)
-            .context("no seated login1 session found")
+            .filter(|(_, row_uid, _, seat_id, _)| *row_uid == uid && !seat_id.is_empty())
+            .collect();
+
+        if candidates.is_empty() {
+            anyhow::bail!("no seated login1 session found for uid {uid}");
+        }
+
+        // Deterministic tie-break when this uid owns more than one seated
+        // session (e.g. a physical seat plus a remote/VNC seat): sort by
+        // session id first so iteration order is never "whatever
+        // ListSessions happened to return" (that order is not documented as
+        // stable), then prefer whichever session login1 itself marks
+        // `Active` -- the one actually receiving input on its seat, i.e.
+        // the session a human is really looking at right now, which is
+        // exactly the one whose lock state this probe cares about. If none
+        // reports `Active` (this process's uid has seated sessions, but none
+        // is foregrounded -- plausible right after a fast user switch),
+        // fall back to the lowest session id for full determinism rather
+        // than picking arbitrarily.
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, _, _, _, path) in &candidates {
+            let session = zbus::blocking::Proxy::new(
+                manager.connection(),
+                "org.freedesktop.login1",
+                path,
+                "org.freedesktop.login1.Session",
+            );
+            if let Ok(session) = session {
+                if session.get_property::<bool>("Active").unwrap_or(false) {
+                    return Ok(path.clone());
+                }
+            }
+        }
+
+        Ok(candidates[0].4.clone())
+    }
+
+    /// This process's own real uid, read from `/proc/self/status` rather
+    /// than via a new dependency (no `libc` crate is in this project's
+    /// dependency tree to call `getuid()` through, and adding one is out of
+    /// scope for this fix) or an environment variable (`$USER`/`$UID` can be
+    /// stale, unset, or spoofed by whatever launched this process -- a
+    /// filesystem read of the kernel's own view of this process is the more
+    /// robust of the two dependency-free options). The `Uid:` line reports
+    /// four values (real, effective, saved, filesystem); the real uid (the
+    /// first) is what `ListSessions`' uid column is compared against.
+    fn current_uid() -> Result<u32> {
+        let status =
+            std::fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("Uid:"))
+            .context("no Uid: line in /proc/self/status")?;
+        line.split_whitespace()
+            .nth(1)
+            .context("malformed Uid: line in /proc/self/status")?
+            .parse::<u32>()
+            .context("non-numeric uid in /proc/self/status")
     }
 }
 
