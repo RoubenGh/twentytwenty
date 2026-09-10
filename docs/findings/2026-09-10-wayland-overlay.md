@@ -17,6 +17,7 @@
 4. A baseline screenshot (`/tmp/spike-baseline.png`) was taken after the spike exited, to check for the presence/location of the KDE panel on the live desktop.
 5. `busctl --user introspect org.kde.KWin /KWin` was used (introspection only — not the interactive `queryWindowInfo`/`showDebugConsole` calls) to check for a non-interactive window-list API.
 6. `src-tauri/src/lib.rs` was reverted with `git checkout src-tauri/src/lib.rs` once evidence was collected. Screenshots were left in `/tmp`, not committed.
+7. **Spike v2 (round 2)**, to resolve the three questions round 1 couldn't answer: watchdog extended to 45 seconds, window pointed at a purpose-built `public/spike.html` (transparent page body, one clearly-bordered opaque panel reading "SPIKE — click another window, then press Escape", and a keydown handler calling `window.__TAURI__.window.getCurrentWindow().close()` on Escape). Built ahead of time (`cargo build`) and verified `spike.html` was actually served by a standalone `vite` dev server before handoff, but **not launched by the agent** — the user ran `pnpm tauri dev` themselves and drove the interaction (clicking another window, pressing Escape) directly, then reported results and a screenshot. That is the source of the Q4/Q5/Q6 updates below. `src-tauri/src/lib.rs` and `public/spike.html` were reverted/deleted afterward; nothing from spike v2 is kept in the tree.
 
 ## Raw evidence
 
@@ -51,13 +52,32 @@ Answered, observed. A window appeared on the (only) monitor, confirmed visually 
 Answered, observed. Yes. The spike screenshot shows the app content filling the entire 1920x1200 frame with no panel visible, while a baseline screenshot taken moments later (spike closed) shows a bottom panel/taskbar present at that location on the same monitor. The overlay covered the panel.
 
 **Q4. Does it stay above other windows when you click another application?**
-**NEEDS HUMAN OBSERVATION.** This requires genuine interactive focus-switching (clicking a different app window while the overlay is up) that cannot be simulated or inferred from a static screenshot or process state. Not tested; no claim is made either way.
+**PASS — observed by the human tester in spike v2, not inferred by the agent.** The user ran the spike themselves, clicked another application window while the overlay was up, and reported the overlay did not go away — it stayed on top. This was the load-bearing open question from round 1 and it resolved positively.
 
 **Q5. Does transparency work, or is the background opaque black?**
-**Inconclusive from available evidence — recorded honestly rather than guessed.** The window was built with `.transparent(true)`, but the Tauri starter template's own page content paints an opaque dark background (`Welcome to Tauri` page) across the entire viewport. A screenshot of "true compositor transparency showing the wallpaper through" and "an opaque dark webview background" would look identical here, because the confound is the app content itself, not the compositor. No genuinely transparent region was visible anywhere in the capture, but this spike cannot distinguish "Wayland ignored `.transparent(true)`" from "the page's own CSS is simply opaque on top of a working transparent window." Answering this for real requires a test page with an explicit `background: transparent` body and a visual check for the desktop showing through — that step was not part of the brief's spike page and was not performed.
+**WORKS — confirmed via the user's screenshot evidence from spike v2, overriding their own initial impression.** The user's first-glance read of the overlay was "solid black," but the screenshot they captured during the run shows otherwise: outside the spike's bordered panel, their own browser window (a tab showing "Rankings · Consensus · Splits · Odds · Streaks") and terminal text are visible through the overlay. That is the live desktop showing through a genuinely transparent window — only the bordered panel itself is opaque, and only because `spike.html`'s CSS deliberately paints it that way (`.panel { background: #111318; ... }` against an otherwise `background: transparent` body). Conclusion: **KWin honors `.transparent(true)` on Wayland.** (Note: this reverses the round-1 finding, which was correctly marked inconclusive because the round-1 template page had no transparent region to test against — round 2's purpose-built page fixed that confound.)
 
 **Q6. Does Escape reach the page, and does the window close cleanly?**
-Split answer. **Window/process lifecycle: answered, observed** — the process exited cleanly by two independent mechanisms: the 20-second watchdog (`std::process::exit(0)`, exit code 0, no leftover processes per `pgrep -af`) and manual `pkill -f twentytwenty` (SIGTERM, exit code 143, no leftover processes). No hangs, no zombie processes, no stuck windows in either run. **Whether Escape specifically reaches the webview and triggers a close: NEEDS HUMAN OBSERVATION.** The brief's spike code registers no Escape/keyboard handler at all, so this was never wired up or tested; only the external kill paths were exercised.
+Split answer, both halves now resolved. **Escape reaching the page: PASS, observed by the human.** The on-screen status text updated to a specific error message when Escape was pressed, which is direct proof the keydown handler ran inside the webview:
+```
+Escape received, close() failed: window.close not allowed. Permissions associated with this command: core:window:allow-close
+```
+**The close itself failed — but purely on a capabilities/permissions ground, not a Wayland/compositor ground.** See "Required capability changes for Task 13" below. Separately, general process/window lifecycle (creation, forced kill, clean exit) was confirmed clean in round 1 by two independent mechanisms (watchdog auto-exit, code 0; manual `pkill -f twentytwenty`, SIGTERM/143), with no hangs, zombies, or stuck windows in either run.
+
+## Required capability changes for Task 13
+
+This is the single most actionable output of the spike. The Escape-to-close failure in Q6 was **not** a Wayland/compositor limitation — it was Tauri's own permission system refusing the call. The exact error, verbatim, as it rendered on screen when the user pressed Escape:
+
+```
+Escape received, close() failed: window.close not allowed. Permissions associated with this command: core:window:allow-close
+```
+
+Root cause: `src-tauri/capabilities/default.json` grants only `core:default` and `opener:default`, and is scoped with `"windows": ["main"]`. The spike's overlay windows were labelled `spike-0` (and Task 13's real overlay windows are expected to be labelled something like `tt-overlay-N`) — neither matches `"main"`, so those windows receive none of the window-control or event permissions they need, including `core:window:allow-close`.
+
+**Task 13 must, before wiring up any close/dismiss interaction on the overlay:**
+- Grant `core:window:allow-close` (and any other window/event permissions the real overlay needs, e.g. show/hide, always-on-top toggling, event listening) to windows matching the overlay's actual label pattern.
+- Do this either by widening `default.json`'s `"windows"` list to include the overlay label pattern, or — preferable for least-privilege — by adding a dedicated capability file scoped to just the overlay windows with just the permissions they need.
+- Without this, Task 13's overlay will visually behave correctly but Escape/any programmatic close will silently (or loudly, as here) fail at the permissions layer, independent of anything Wayland-related.
 
 ## KWin non-interactive introspection
 
@@ -65,11 +85,8 @@ Split answer. **Window/process lifecycle: answered, observed** — the process e
 
 ## Decision
 
-**CONDITIONAL.** The criteria this spike could measure directly were all satisfied on the one available display: `available_monitors()` positions agree with an independent source (`kscreen-doctor`), the window's requested position/size were honored, fullscreen mode covered the entire monitor including the panel, and the window lifecycle (creation, forced kill, clean exit) was reliable with no hangs.
+**`FULLSCREEN_PER_MONITOR`**
 
-What remains open is exactly the part the decision language hinges on ("stay on top" — Q4) and the multi-monitor claim (Q1/Q2, untestable on single-display hardware):
+All criteria the decision hinges on are now satisfied: positioning matches an independent source (`kscreen-doctor`), fullscreen coverage includes the panel, the window lifecycle is clean, transparency works (Q5, confirmed by screenshot evidence), the overlay stays above other windows after a focus change (Q4, confirmed by direct human observation), and Escape reaches the webview (Q6, confirmed by direct human observation) — its close call fails only on a capabilities/permissions ground that Task 13 can and must fix (see "Required capability changes for Task 13" above), not a compositor ground.
 
-- If a human confirms the overlay **stays above other windows** after clicking a different application (Q4 = yes), and this holds when tested on the actual multi-monitor target hardware: **decision is `FULLSCREEN_PER_MONITOR`.**
-- If a human observes that clicking another window **raises it above the overlay**, or that a second monitor does not receive its own correctly-positioned window: **decision is `CENTERED_FALLBACK`** — Task 13 should build a single large centered always-on-top window instead of a per-monitor wash.
-
-No default is assumed; this must be resolved by the human observation on Q4 (and, ideally, a re-run of Q1/Q2 on multi-monitor hardware) before Task 13 starts.
+**Caveat carried forward, not blocking the decision:** this test machine has a single built-in display, so the "per-monitor" half of `FULLSCREEN_PER_MONITOR` — a correctly-positioned, correctly-fullscreened overlay on *each* of several simultaneous monitors — has not actually been exercised on multiple displays at once. The user has confirmed they regularly dock to external displays, so this path ships **unverified on multi-monitor hardware** until the next time they're docked. This belongs on the **Task 16 smoke checklist** as a docked-only check: confirm `available_monitors()` reports all connected displays with correct positions, and confirm an overlay window lands correctly fullscreened on each one, while docked.
