@@ -29,6 +29,9 @@ zbus = { version = "5", features = ["blocking"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
   "Win32_Foundation",
