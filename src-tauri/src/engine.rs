@@ -27,7 +27,15 @@ pub enum Command {
     TrayStatus(TrayStatus),
 }
 
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserEvent {
+    Snooze,
+    Skip,
+    BreakNow,
+    Pause { for_ms: Option<u64> },
+    Resume,
+}
+
 pub struct Engine {
     state: State,
     bank_secs: u64,
@@ -97,7 +105,34 @@ impl Engine {
                     });
                 }
             }
-            State::BreakDue | State::Snoozed | State::Paused => {}
+            State::Snoozed => {
+                if active {
+                    self.snooze_secs += step;
+                    self.away_secs = 0;
+                    if self.snooze_secs >= SNOOZE_LENGTH_SECS {
+                        self.state = State::BreakDue;
+                        self.snooze_secs = 0;
+                        self.defer_secs = 0;
+                    }
+                } else {
+                    self.away_secs += step;
+                    if self.away_secs >= NATURAL_BREAK_SECS {
+                        self.state = State::Accumulating;
+                        self.bank_secs = 0;
+                        self.away_secs = 0;
+                        self.snooze_secs = 0;
+                    }
+                }
+            }
+            State::Paused => {
+                if let Some(until) = self.paused_until_ms {
+                    if now_ms >= until {
+                        self.state = State::Accumulating;
+                        self.paused_until_ms = None;
+                    }
+                }
+            }
+            State::BreakDue => {}
         }
 
         if self.state == State::BreakDue {
@@ -123,6 +158,52 @@ impl Engine {
             }
         }
 
+        cmds.push(Command::TrayStatus(self.tray_status()));
+        cmds
+    }
+
+    pub fn on_user(&mut self, ev: UserEvent, now_ms: u64) -> Vec<Command> {
+        let mut cmds = Vec::new();
+        match ev {
+            UserEvent::Snooze => {
+                self.state = State::Snoozed;
+                self.snooze_secs = 0;
+                self.away_secs = 0;
+                self.break_remaining = 0;
+                cmds.push(Command::HideOverlay);
+            }
+            UserEvent::Skip => {
+                self.state = State::Accumulating;
+                self.bank_secs = 0;
+                self.away_secs = 0;
+                self.snooze_secs = 0;
+                self.break_remaining = 0;
+                cmds.push(Command::HideOverlay);
+            }
+            UserEvent::BreakNow => {
+                self.state = State::OnBreak;
+                self.break_remaining = BREAK_LENGTH_SECS;
+                cmds.push(Command::ShowOverlay);
+                cmds.push(Command::UpdateOverlay {
+                    remaining_secs: BREAK_LENGTH_SECS,
+                });
+            }
+            UserEvent::Pause { for_ms } => {
+                self.state = State::Paused;
+                self.bank_secs = 0;
+                self.away_secs = 0;
+                self.snooze_secs = 0;
+                self.break_remaining = 0;
+                self.paused_until_ms = for_ms.map(|d| now_ms + d);
+                cmds.push(Command::HideOverlay);
+            }
+            UserEvent::Resume => {
+                self.state = State::Accumulating;
+                self.paused_until_ms = None;
+                self.bank_secs = 0;
+                self.away_secs = 0;
+            }
+        }
         cmds.push(Command::TrayStatus(self.tray_status()));
         cmds
     }
@@ -316,5 +397,77 @@ mod tests {
         let s = Sample { idle_seconds: ACTIVE_GRACE_SECS - 1, ..Default::default() };
         run(&mut e, s, 30, 0);
         assert_eq!(e.bank_secs(), 30);
+    }
+
+    #[test]
+    fn snoozing_refires_after_the_snooze_length() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        e.on_user(UserEvent::Snooze, t);
+        assert_eq!(e.state(), State::Snoozed);
+        let t = run(&mut e, typing(), SNOOZE_LENGTH_SECS - 5, t);
+        assert_eq!(e.state(), State::Snoozed);
+        run(&mut e, typing(), 5, t);
+        assert_eq!(e.state(), State::OnBreak);
+    }
+
+    #[test]
+    fn snooze_is_measured_in_active_time_not_wall_clock() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        e.on_user(UserEvent::Snooze, t);
+        // Idle for less than a natural break: the snooze timer must not advance.
+        let t = run(&mut e, away(), NATURAL_BREAK_SECS - 10, t);
+        let t = run(&mut e, typing(), SNOOZE_LENGTH_SECS - 5, t);
+        assert_eq!(e.state(), State::Snoozed);
+        run(&mut e, typing(), 5, t);
+        assert_eq!(e.state(), State::OnBreak);
+    }
+
+    #[test]
+    fn a_natural_break_while_snoozed_clears_everything() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        e.on_user(UserEvent::Snooze, t);
+        run(&mut e, away(), NATURAL_BREAK_SECS, t);
+        assert_eq!(e.state(), State::Accumulating);
+        assert_eq!(e.bank_secs(), 0);
+    }
+
+    #[test]
+    fn skipping_resets_the_full_interval() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        let cmds = e.on_user(UserEvent::Skip, t);
+        assert!(cmds.contains(&Command::HideOverlay));
+        assert_eq!(e.state(), State::Accumulating);
+        assert_eq!(e.bank_secs(), 0);
+    }
+
+    #[test]
+    fn pausing_stops_accumulation_entirely() {
+        let mut e = Engine::new();
+        e.on_user(UserEvent::Pause { for_ms: None }, 0);
+        run(&mut e, typing(), 600, 0);
+        assert_eq!(e.state(), State::Paused);
+        assert_eq!(e.bank_secs(), 0);
+    }
+
+    #[test]
+    fn a_timed_pause_expires_on_its_own() {
+        let mut e = Engine::new();
+        e.on_user(UserEvent::Pause { for_ms: Some(60 * TICK_MS) }, 0);
+        let t = run(&mut e, typing(), 59, 0);
+        assert_eq!(e.state(), State::Paused);
+        run(&mut e, typing(), 2, t);
+        assert_eq!(e.state(), State::Accumulating);
+    }
+
+    #[test]
+    fn break_now_shows_the_overlay_immediately() {
+        let mut e = Engine::new();
+        let cmds = e.on_user(UserEvent::BreakNow, 0);
+        assert!(cmds.contains(&Command::ShowOverlay));
+        assert_eq!(e.state(), State::OnBreak);
     }
 }
