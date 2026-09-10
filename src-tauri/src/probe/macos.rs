@@ -39,6 +39,7 @@ use core_graphics::event::CGEventType;
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use log;
 
 const ASSERTION_POLL: Duration = Duration::from_secs(5);
 
@@ -55,7 +56,7 @@ impl MacosProbe {
 
     /// Returns (display_held_awake, presenting). Shelling out to pmset is cheap
     /// at this cadence and far easier to reason about than IOKit FFI we cannot run.
-    /// A failed invocation degrades to (false, false).
+    /// A failed invocation degrades to (false, false) and is logged.
     fn assertions(&mut self) -> (bool, bool) {
         if let Some((at, held, presenting)) = self.cached_assertions {
             if at.elapsed() < ASSERTION_POLL {
@@ -63,17 +64,34 @@ impl MacosProbe {
             }
         }
 
-        let (held, presenting) = Command::new("pmset")
+        let (held, presenting) = match Command::new("pmset")
             .args(["-g", "assertions"])
             .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|output| parse_pmset_assertions(&output))
-            // On pmset failure (not found, crashed, non-UTF8, etc.), degrade to
-            // false. This is the safe direction: a missing signal is better than
-            // a stuck-true assertion state. A real diagnostic would log the error
-            // here so the operator can investigate.
-            .unwrap_or((false, false));
+        {
+            Ok(output) => {
+                if !output.status.success() {
+                    log::warn!("pmset -g assertions exited with status {}", output.status);
+                    (false, false)
+                } else {
+                    match String::from_utf8(output.stdout) {
+                        Ok(text) => parse_pmset_assertions(&text),
+                        Err(e) => {
+                            log::warn!("pmset -g assertions stdout was not valid UTF-8: {}", e);
+                            (false, false)
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Log every failure even though this runs every 5 seconds. A broken
+                // pmset is a platform-level failure that makes screen time tracking
+                // non-functional. Repeated warnings in the log are acceptable and
+                // expected until the root cause is fixed; they signal to an operator
+                // that something is seriously wrong and needs investigation.
+                log::warn!("pmset -g assertions failed to spawn: {}", e);
+                (false, false)
+            }
+        };
 
         self.cached_assertions = Some((Instant::now(), held, presenting));
         (held, presenting)
