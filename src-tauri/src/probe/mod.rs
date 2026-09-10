@@ -1,4 +1,6 @@
 pub mod fallback;
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Sample {
