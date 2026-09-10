@@ -29,6 +29,8 @@ impl ActivityProbe for WindowsProbe {
         };
         // SAFETY: info is correctly sized and lives for the duration of the call.
         unsafe { GetLastInputInfo(&mut info) }.ok()?;
+        // SAFETY: GetTickCount64 takes no arguments and has no preconditions;
+        // it simply returns the system tick count as a u64.
         let now = unsafe { GetTickCount64() };
         // GetTickCount64 returns milliseconds since boot; convert to seconds,
         // saturating on underflow (clock drift safety).
