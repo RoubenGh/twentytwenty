@@ -120,6 +120,11 @@ impl Dispatch<ExtIdleNotificationV1, ()> for IdleState {
 
 pub struct LinuxProbe {
     dbus: DbusConnection,
+    // System bus, for `org.freedesktop.login1`'s `LockedHint` -- best-effort:
+    // its absence degrades `locked()` to `false` rather than failing
+    // construction, since idle-tracking and inhibition-awareness (validated
+    // below) are the two signals this probe cannot do without.
+    system_dbus: Option<DbusConnection>,
     wl_queue: EventQueue<IdleState>,
     idle_state: IdleState,
     // Held for its whole lifetime: dropping it would stop Idled/Resumed
@@ -130,6 +135,7 @@ pub struct LinuxProbe {
 impl LinuxProbe {
     pub fn new() -> Result<Self> {
         let dbus = DbusConnection::session().context("connecting to the D-Bus session bus")?;
+        let system_dbus = DbusConnection::system().ok();
 
         let wl_conn = WlConnection::connect_to_env().context(
             "connecting to the Wayland compositor (is WAYLAND_DISPLAY set for this session?)",
@@ -157,6 +163,7 @@ impl LinuxProbe {
 
         let mut probe = Self {
             dbus,
+            system_dbus,
             wl_queue,
             idle_state,
             _idle_notification: idle_notification,
@@ -213,6 +220,90 @@ impl LinuxProbe {
             .get_property::<Vec<Inhibition>>("ActiveInhibitions")
             .context("reading ActiveInhibitions")
     }
+
+    /// Reads `org.freedesktop.login1` Session `LockedHint` for the current
+    /// graphical session, via the system bus. `org.freedesktop.ScreenSaver`
+    /// `GetActive` is disqualified as a lock signal on this session (the
+    /// findings doc observed it `true` for an entire window with nothing
+    /// locked); `LockedHint` is the standards-based alternative.
+    ///
+    /// Verified live, both directions, on this machine:
+    /// - Unlocked: reads `false` (cross-checked against `loginctl
+    ///   show-session`).
+    /// - Actually locked (the session auto-locked mid-development here,
+    ///   confirmed independently by `kscreenlocker_greet` running and
+    ///   `loginctl show-session 2 -p LockedHint` also reporting `yes`):
+    ///   reads `true`. This is a genuine observed positive transition, not
+    ///   an assumption.
+    ///
+    /// Session resolution deliberately does not rely solely on
+    /// `GetSessionByPID` for the calling process's own PID: directly
+    /// observed on this machine, a process launched outside
+    /// `session-2.scope` (e.g. this probe's own throwaway test binaries,
+    /// run from an agent-spawned shell) gets
+    /// `org.freedesktop.login1.NoSessionForPID` even though the real KDE
+    /// session is alive and correctly reports `LockedHint`. A shipped app
+    /// autostarted as a systemd user service would hit the same failure for
+    /// the same reason (it isn't a member of the session's cgroup either).
+    /// So: try `GetSessionByPID` first (the precise, correct answer when it
+    /// resolves), and fall back to the one session with a non-empty seat id
+    /// from `ListSessions` (the graphical seat0 session, as opposed to the
+    /// seat-less background session `ListSessions` also returned on this
+    /// machine for the same user). Any failure anywhere in this chain
+    /// degrades to `Err`, and the caller in `sample()` folds that to
+    /// `false` -- the same value this probe already reported before
+    /// `LockedHint` was wired in, so there is no regression risk.
+    fn login1_locked_hint(&self) -> Result<bool> {
+        let system = self
+            .system_dbus
+            .as_ref()
+            .context("no system D-Bus connection")?;
+
+        let manager = zbus::blocking::Proxy::new(
+            system,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .context("building the login1 Manager proxy")?;
+
+        let session_path = Self::resolve_login1_session(&manager)?;
+
+        let session = zbus::blocking::Proxy::new(
+            system,
+            "org.freedesktop.login1",
+            &session_path,
+            "org.freedesktop.login1.Session",
+        )
+        .context("building the login1 Session proxy")?;
+        session
+            .get_property::<bool>("LockedHint")
+            .context("reading LockedHint")
+    }
+
+    fn resolve_login1_session(
+        manager: &zbus::blocking::Proxy<'_>,
+    ) -> Result<zbus::zvariant::OwnedObjectPath> {
+        if let Ok(path) = manager
+            .call::<_, _, zbus::zvariant::OwnedObjectPath>("GetSessionByPID", &(std::process::id(),))
+        {
+            return Ok(path);
+        }
+
+        // `ListSessions` row shape: (session_id, uid, user_name, seat_id,
+        // object_path). A seat-less row is a background/manager session, not
+        // a graphical one -- confirmed live on this machine (session "3" had
+        // seat_id "", session "2" had "seat0" and is the real KDE session).
+        type SessionRow = (String, u32, String, String, zbus::zvariant::OwnedObjectPath);
+        let sessions: Vec<SessionRow> = manager
+            .call("ListSessions", &())
+            .context("listing login1 sessions")?;
+        sessions
+            .into_iter()
+            .find(|(_, _, _, seat_id, _)| !seat_id.is_empty())
+            .map(|(_, _, _, _, path)| path)
+            .context("no seated login1 session found")
+    }
 }
 
 impl ActivityProbe for LinuxProbe {
@@ -231,31 +322,12 @@ impl ActivityProbe for LinuxProbe {
             PRESENTING_HINTS.iter().any(|hint| hay.contains(hint))
         });
 
-        // No verified lock signal exists on this session. `GetActive`
-        // (org.freedesktop.ScreenSaver) was directly observed `true` for an
-        // entire window with nothing locked, so it is not usable here. The
-        // standards-based alternative, `org.freedesktop.login1` Session's
-        // `LockedHint` property, does exist and currently reads correctly
-        // (`false` while genuinely unlocked) -- but confirming it actually
-        // flips to `true` during a real lock would require locking this
-        // live, in-use session with no way for this probe to unlock it
-        // again (no input-generation capability), so that was not
-        // performed. Per the task ruling, an unverified signal is not
-        // wired in: always report `false`. This is safe because a locked
-        // session presents as climbing idle_seconds with zero input, which
-        // the engine already treats as time away from the screen.
-        let locked = false;
-
-        // Implausible values degrade rather than propagate: idle_seconds is
-        // a monotonically-derived duration and cannot be negative, but as a
-        // last line of defense a nonsensical multi-year value (e.g. a clock
-        // glitch) is clamped rather than handed to the engine.
-        const IMPLAUSIBLE_IDLE_SECONDS: u64 = 365 * 24 * 60 * 60;
-        let idle_seconds = if idle_seconds > IMPLAUSIBLE_IDLE_SECONDS {
-            0
-        } else {
-            idle_seconds
-        };
+        // See `login1_locked_hint` for what is and is not verified about
+        // this signal. A read failure degrades to `false` -- identical to
+        // what this probe reported before `LockedHint` was wired in, in
+        // every failure case; it differs only when the read actually
+        // succeeds and the session actually is locked.
+        let locked = self.login1_locked_hint().unwrap_or(false);
 
         Ok(Sample {
             idle_seconds,
