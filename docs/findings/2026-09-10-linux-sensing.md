@@ -5,11 +5,12 @@ XWayland but was not used (an X11 idle API would only see XWayland clients
 and report nonsense on this session). Single built-in display eDP-1,
 1920x1200.
 
-Spike code: `src-tauri/examples/sense_spike.rs` (kept in the working tree,
-uncommitted, for the human test below) and
-`src-tauri/examples/run_human_test.sh` (the prepared human-run command).
-Both are throwaway and should be deleted once the human test is done and
-Task 9 starts.
+Spike code (`src-tauri/examples/sense_spike.rs`,
+`src-tauri/examples/run_human_test.sh`, and the `wayland-client` /
+`wayland-protocols` additions to `src-tauri/Cargo.toml`) was used to
+produce the results below and has since been reverted from the working
+tree. Task 9 should add its own real implementation and dependencies
+rather than resurrect this throwaway code.
 
 ## Bottom line for Task 9
 
@@ -74,11 +75,14 @@ org.kde.Solid.PowerManagement.PolicyAgent interface -        -            -
 `ListInhibitions` exists but is flagged `deprecated`, and its declared
 signature (`a{ss}`) turned out to be **wrong** -- see Step 3. The
 non-deprecated replacement is the `ActiveInhibitions` property, signature
-`a(ssssu)` (array of 5-tuples: almost certainly
-`(cookie_app, cookie_id, application_name, reason, type_or_flags)` --
-not decoded in this spike; worth using instead of `ListInhibitions` in
-Task 9 since it is the maintained API and a property read/watch is cheaper
-than polling a deprecated method).
+`a(ssssu)`, confirmed via `gdbus introspect` to carry the Qt type name
+`QList<PolicyAgentInhibition>`. Its 5-tuple fields, decoded from live data
+(see "The false-positive risk" section below), are
+`(category_label, app_name, reason, action, policy_bitmask)` -- NOT the
+`(cookie_app, cookie_id, application_name, reason, type_or_flags)` shape
+originally guessed here. Use `ActiveInhibitions` in Task 9 instead of
+`ListInhibitions`: it is the maintained API and a property read is cheaper
+than polling a deprecated method.
 
 `org.freedesktop.login1` fallback (`loginctl show-session 2 -p IdleHint -p IdleSinceHint -p IdleSinceHintMonotonic -p CanIdle`):
 
@@ -254,71 +258,177 @@ human running the passive-viewing test below also, incidentally, moves
 the mouse at the very end, that would be a second confirming data point,
 but it isn't required.
 
-## PENDING HUMAN TEST: the video-playing check (Step 3, item 3)
+## Human test: the video-playing check (Step 3, item 3) -- PASS
 
-**This is the single most consequential measurement in this project and
-has NOT been performed.** No inference has been made about it. It is not
-assumed that any inhibition mechanism observed elsewhere applies to video
-playback -- this must be measured directly.
+The human ran `bash src-tauri/examples/run_human_test.sh`, started a
+fullscreen video with sound, and left the keyboard/mouse untouched. Output
+was captured to `/tmp/tt-sense.log` (118 of the 120 seconds captured before
+the harness's own timeout cut the log; the script's own 120s `timeout` was
+about to end it anyway, so this is a complete result).
 
-Specifically pending:
-- Does an inhibition appear in `ListInhibitions` while a fullscreen
-  YouTube video plays, naming the browser?
-- What is the literal reason string?
-- Does `idle_ms` (from `ext_idle_notifier_v1`) keep climbing while the
-  video plays (meaning the compositor-level idle notifier is blind to the
-  video, and inhibition-watching is the *only* signal that distinguishes
-  "video playing" from "actually away"), or does it stay near zero
-  (meaning something is resetting/suppressing the idle clock directly)?
-
-**Result: PENDING HUMAN TEST.**
-
-### The exact command for the human to run
+From t=30s to t=118s (89 unbroken seconds), `idle_ms` climbed continuously
+from 0 to 88963 with **no resets**, i.e. no keyboard/mouse input was
+registered for the entire span. Throughout that same span the inhibitions
+map read exactly:
 
 ```
-bash /home/rouben/twentytwenty/src-tauri/examples/run_human_test.sh
+Ok({"firefox": "Playing audio"})
 ```
 
-This script (already built in release mode, so it starts instantly):
-- Prints an instruction banner: start a fullscreen video, then do not
-  touch the keyboard or mouse.
-- Waits 5 seconds, then runs `sense_spike` for exactly 120 seconds via
-  `timeout 120s`, so it cannot be left as a stuck process.
-- Prints one line every 2 seconds with elapsed time, `idle_ms`, and the
-  full inhibitions map.
-- Tees all output to `/tmp/tt-sense.log`, in addition to the terminal.
+**Result: PASS.** A plain idle check (no inhibition awareness) would have
+declared the user "away" after 60s of no input. The inhibition-aware
+design correctly identifies that something is holding the session active
+despite zero input, which is exactly the natural-break-suppression
+behavior the spec requires. Raw numbers (idle_ms at each 2s tick from
+t=30s): climbing steadily from 0 to 88963 over the 88s window, consistent
+with `ext_idle_notifier_v1`'s `idle_ms` computation not resetting because
+no `Resumed` event fired.
 
-Once that log exists, this section should be updated with the actual
-reason string, the actual signature returned, and whether `idle_ms` kept
-climbing during playback -- replacing "PENDING HUMAN TEST" with the real
-answer.
+## The false-positive risk: audio-only inhibitions
 
-## Recommendations for Task 9
+The reason string captured above is **`"Playing audio"`**, not "playing
+video". The product spec's rule is "something is holding the **display**
+awake" -- a session/suspend inhibition triggered by background audio (e.g.
+someone starts a podcast or Spotify and leaves for lunch with the screen
+unattended) is a different thing, and treating it as screen-active would
+produce a false positive: the break bank keeps filling for someone who
+isn't looking at a screen at all.
 
-1. Do not use `org.freedesktop.ScreenSaver.GetSessionIdleTime`,
-   `GetActiveTime`, or `GetActive` -- none produce a usable idle signal on
-   this session.
-2. Do not trust `logind` `IdleHint` as an automatic idle source here
-   without further, longer-duration verification -- it did not move in
-   the tested window.
-3. Use `ext_idle_notifier_v1` (via `wayland-client` +
-   `wayland-protocols`, `staging` feature) directly for idle detection.
-   Unit: **milliseconds**, and it must be computed client-side from the
-   `Idled`/`Resumed` event timestamps -- there is no polled
-   "GetIdleTime"-style call in this protocol.
-4. For inhibition detection, prefer the non-deprecated
-   `ActiveInhibitions` property (`a(ssssu)`) over `ListInhibitions`
-   (`aas`, deprecated, and its own introspection signature is wrong).
-   Whichever is used, deserialize defensively (as this spike had to) --
-   do not trust the DBus introspection XML's declared signature without
-   checking a live call.
-5. Treat `zwp_idle_inhibit_manager_v1` (client-side inhibit-while-visible)
-   as a real possibility for how video players actually prevent idling on
-   Wayland, separate from the KDE PolicyAgent DBus inhibition list. If the
-   pending human test shows no PolicyAgent inhibition appears during video
-   playback, this is the next thing to check, not evidence that "detecting
-   video playback" is impossible.
-6. The human test result above is the deciding evidence for whether
-   inhibition-watching or something else is needed to distinguish "video
-   playing" from "user genuinely away." Do not proceed with Task 9's core
-   design until that section says something other than PENDING.
+### What the 5th field of `ActiveInhibitions` (`a(ssssu)`) encodes
+
+Read live, right now, via both `busctl --user get-property` and
+`gdbus call ... Properties.Get`:
+
+```
+$ busctl --user get-property org.kde.Solid.PowerManagement.PolicyAgent \
+    /org/kde/Solid/PowerManagement/PolicyAgent \
+    org.kde.Solid.PowerManagement.PolicyAgent ActiveInhibitions
+a(ssssu) 2 "idle" "firefox" "Playing audio" "block" 3 "idle" "firefox" "Playing video" "block" 3
+```
+
+At that moment there were **two simultaneous** inhibitions from firefox:
+one reasoned `"Playing audio"`, one reasoned `"Playing video"` -- both with
+identical trailing values: category `"idle"`, action `"block"`, bitmask
+**`3`**. `gdbus introspect` confirms the Qt struct name
+`QList<PolicyAgentInhibition>` and that `AddInhibition(in u types, in s
+app_name, in s reason, out u cookie)` is the write side, so the `u` in the
+tuple is that same `types` bitmask, echoed back.
+
+A few seconds later, polled again, the video-reasoned row had disappeared
+and only this remained (also confirmed stable across 8 more polls, ~1.5s
+apart):
+
+```
+(<[('sleep', 'firefox', 'Playing audio', 'block', uint32 3)]>,)
+```
+
+Two things established from this, both directly observed, not guessed:
+
+1. **The bitmask value observed in every sample, for both "Playing audio"
+   and "Playing video", was the same: `3`.** Decoding `3` against KDE
+   PowerDevil's known `PolicyAgent` `RequiredPolicies` flags
+   (`InterruptSession = 1`, `ChangeScreenSettings = 2`, `ChangeProfile =
+   4` -- this enum is recalled from general KDE/PowerDevil ecosystem
+   knowledge; no header or source for it was found on this machine to
+   verify against directly, see below), `3 = InterruptSession |
+   ChangeScreenSettings`, i.e. "don't suspend the session" AND "don't
+   change screen settings (dim/blank)". **Firefox requested the exact
+   same bitmask for its audio-only-reasoned inhibition as for its
+   video-reasoned one.** No source/header file for this enum was found on
+   this machine (`find` turned up no PolicyAgent headers or XML;
+   `libpowerdevilcore.so` is stripped and its string table doesn't contain
+   the enum names) -- the bit values above are inferred from the known
+   public KDE `PolicyAgent` API rather than confirmed against source
+   present on this machine, and should be treated as a strong hypothesis,
+   not a certainty.
+2. **The first field (`"idle"` vs `"sleep"`) changed on its own, for the
+   same ongoing audio inhibition, without any bitmask change.** This
+   means the first field is not a stable identifier of inhibition
+   category -- it looks like an internal "what's imminently blocked next"
+   label that can drift, not something safe to filter on.
+
+### Is the bitmask a reliable audio-vs-video discriminator? NOT ESTABLISHED -- needs a human test
+
+The one clean side-by-side data point available (the audio+video rows
+captured simultaneously above) shows **identical bitmasks (3) for both**.
+That is real evidence *against* naively filtering `ActiveInhibitions` by
+"does the bitmask include the screen-settings bit" as a fix: on this data,
+firefox's audio-only-reasoned inhibition already requests the same
+screen-related bit as its video-reasoned one. It is possible this was not
+actually a clean "audio only, no video visible" scenario (the video from
+the passive-viewing test may still have been open/paused nearby, or
+Firefox may always request both bits for any tab with a `<video>` element
+regardless of whether that element is the one making sound) -- this could
+not be confirmed without touching the GUI, which was out of scope for the
+agent.
+
+**This needs a targeted human test before Task 9 relies on the bitmask (or
+anything else) to distinguish audio-only from video.** No guess is being
+recorded in its place.
+
+**Exact steps for a human to run this follow-up:**
+
+1. Close all video tabs/players entirely (nothing with a `<video>`
+   element anywhere, even paused/hidden).
+2. Start audio-only playback with **no video element on the page at all**
+   -- e.g. a music streaming site's audio-only view, a plain `<audio>`
+   tag test page, or a local `.mp3` played in a minimal player. Confirm
+   with `busctl --user get-property org.kde.Solid.PowerManagement.PolicyAgent /org/kde/Solid/PowerManagement/PolicyAgent org.kde.Solid.PowerManagement.PolicyAgent ActiveInhibitions`
+   that only a `"Playing audio"` (or similar) reason shows up, and record
+   its 5th-field value.
+3. Stop the audio, then start a fullscreen video with sound and record
+   `ActiveInhibitions` again while it plays, noting its 5th-field value.
+4. Compare the two values. If they differ, the bitmask is a usable
+   discriminator and Task 9 should filter on it. If they are identical (as
+   the one data point here suggests they might be), the bitmask cannot
+   distinguish these cases on this browser/version, and Task 9 will need
+   a different approach (see ruling below).
+
+## Ruling for Task 9
+
+1. **Idle source: `ext_idle_notifier_v1`, unit milliseconds.**
+   `org.freedesktop.ScreenSaver.GetSessionIdleTime` returns a DBus
+   `org.freedesktop.DBus.Error.NotSupported` error on this session --
+   confirmed directly via both `busctl --user call` and zbus. Task 9 must
+   **not** call it, and must not use `GetActiveTime` or `GetActive`
+   either (neither measures idle time -- see Step 3 above). `logind`
+   `IdleHint` is not usable as an automatic fallback here either -- it did
+   not move in the tested window. The confirmed working source is
+   `ext_idle_notifier_v1`, computed client-side from `Idled`/`Resumed`
+   event timestamps as `idle_ms = (now - idled_at) + threshold_ms` while
+   idle, else `0`. This requires `wayland-client` and `wayland-protocols`
+   (`staging` feature) as **required dependencies for Task 9** -- not
+   optional, since no DBus-only path produces a working idle value on
+   this machine.
+2. **Inhibitions: use `ActiveInhibitions`, not `ListInhibitions`.**
+   `ActiveInhibitions` (property, `a(ssssu)`, Qt type
+   `QList<PolicyAgentInhibition>`) is the maintained, non-deprecated API.
+   `ListInhibitions` is deprecated and its own introspection XML lies
+   about its wire signature (claims `a{ss}`, actually `aas`) -- deserialize
+   defensively regardless of which is used, do not trust the declared
+   DBus signature without checking a live call.
+3. **Do not treat "any active inhibition" as "display is being held
+   awake."** The human test proved inhibition-awareness works (PASS,
+   above) but also proved the naive version is unsafe: Firefox's
+   audio-only-reasoned inhibition (`"Playing audio"`) carried the
+   identical policy bitmask (`3`) as its video-reasoned one in the one
+   side-by-side sample captured here. **Do not ship a bitmask filter
+   (e.g. "only count it if `ChangeScreenSettings` is set") without first
+   running the follow-up human test above** to confirm the bitmask ever
+   actually differs between audio-only and video content -- on current
+   evidence it may not.
+4. **If the follow-up test shows the bitmask never discriminates,**
+   Task 9 needs a different signal than `ActiveInhibitions` alone to
+   satisfy "holds the *display* awake" specifically -- candidates worth
+   investigating next, in order: (a) `zwp_idle_inhibit_manager_v1`, the
+   separate client-side Wayland protocol apps use to inhibit idling for a
+   specific visible surface (confirmed advertised by the compositor, not
+   yet probed -- this is closer to "display" semantics than a DBus
+   session-wide inhibition is, since it's tied to a rendered surface); or
+   (b) a fragile, explicitly-flagged reason-string heuristic (e.g.
+   excluding reasons that look audio-only) as a stopgap, clearly
+   documented as app-specific and not guaranteed to generalize beyond
+   Firefox's current wording.
+5. Do not proceed with Task 9's inhibition-filtering design until the
+   follow-up bitmask comparison test (audio-only vs. video, exact steps
+   above) has been run and this document updated with its result.
