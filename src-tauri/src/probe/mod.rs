@@ -92,7 +92,10 @@ pub fn parse_pmset_assertions(output: &str) -> (bool, bool) {
         }
 
         // Detect presenting: screen sharing, screen capture, or similar.
+        // Matched both with and without a space because real process names
+        // (e.g. "ScreenSharingAgent") are compound words with none.
         if trimmed.contains("screen sharing")
+            || trimmed.contains("screensharing")
             || trimmed.contains("screencapture")
             || trimmed.contains("screen capture")
         {

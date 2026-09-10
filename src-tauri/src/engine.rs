@@ -128,7 +128,7 @@ impl Engine {
             }
             State::Paused => {
                 if let Some(until) = self.paused_until_ms {
-                    if now_ms >= until {
+                    if wall_ms >= until {
                         self.state = State::Accumulating;
                         self.paused_until_ms = None;
                     }
