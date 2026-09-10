@@ -66,24 +66,84 @@ impl Engine {
     pub fn tick(&mut self, s: Sample, now_ms: u64, wall_ms: u64) -> Vec<Command> {
         let step = self.advance_clock(now_ms, wall_ms);
         let active = !s.locked && (s.idle_seconds < ACTIVE_GRACE_SECS || s.display_held_awake);
-
         let mut cmds = Vec::new();
-        if self.state == State::Accumulating {
-            if active {
-                self.bank_secs += step;
-                self.away_secs = 0;
-            } else {
-                self.away_secs += step;
-                if self.away_secs >= NATURAL_BREAK_SECS {
-                    self.bank_secs = 0;
+
+        match self.state {
+            State::Accumulating => {
+                if active {
+                    self.bank_secs += step;
                     self.away_secs = 0;
+                } else {
+                    self.away_secs += step;
+                    if self.away_secs >= NATURAL_BREAK_SECS {
+                        self.bank_secs = 0;
+                        self.away_secs = 0;
+                    }
+                }
+                if self.bank_secs >= WORK_INTERVAL_SECS {
+                    self.state = State::BreakDue;
+                    self.defer_secs = 0;
                 }
             }
+            State::OnBreak => {
+                if s.idle_seconds >= BREAK_INPUT_GRACE_SECS {
+                    self.break_remaining = self.break_remaining.saturating_sub(step);
+                }
+                if self.break_remaining == 0 {
+                    self.finish_break(&mut cmds);
+                } else {
+                    cmds.push(Command::UpdateOverlay {
+                        remaining_secs: self.break_remaining,
+                    });
+                }
+            }
+            State::BreakDue | State::Snoozed | State::Paused => {}
         }
-        cmds.push(Command::TrayStatus(TrayStatus::Working {
-            bank_secs: self.bank_secs,
-        }));
+
+        if self.state == State::BreakDue {
+            if s.presenting {
+                self.defer_secs += step;
+                if self.defer_secs > DEFER_LIMIT_SECS {
+                    cmds.push(Command::Notify {
+                        title: "Time to rest your eyes".into(),
+                        body: "Look at something 20 feet away for 20 seconds.".into(),
+                    });
+                    self.state = State::Accumulating;
+                    self.bank_secs = 0;
+                    self.away_secs = 0;
+                    self.defer_secs = 0;
+                }
+            } else {
+                self.state = State::OnBreak;
+                self.break_remaining = BREAK_LENGTH_SECS;
+                cmds.push(Command::ShowOverlay);
+                cmds.push(Command::UpdateOverlay {
+                    remaining_secs: BREAK_LENGTH_SECS,
+                });
+            }
+        }
+
+        cmds.push(Command::TrayStatus(self.tray_status()));
         cmds
+    }
+
+    fn finish_break(&mut self, cmds: &mut Vec<Command>) {
+        self.state = State::Accumulating;
+        self.bank_secs = 0;
+        self.away_secs = 0;
+        self.break_remaining = 0;
+        cmds.push(Command::HideOverlay);
+    }
+
+    fn tray_status(&self) -> TrayStatus {
+        match self.state {
+            State::OnBreak => TrayStatus::Break,
+            State::Snoozed => TrayStatus::Snoozed,
+            State::Paused => TrayStatus::Paused,
+            _ => TrayStatus::Working {
+                bank_secs: self.bank_secs,
+            },
+        }
     }
 
     /// Returns how many seconds to advance. A gap larger than two ticks means
@@ -127,6 +187,89 @@ mod tests {
 
     fn watching() -> Sample {
         Sample { idle_seconds: 300, display_held_awake: true, ..Default::default() }
+    }
+
+    fn presenting() -> Sample {
+        Sample { idle_seconds: 0, presenting: true, ..Default::default() }
+    }
+
+    #[test]
+    fn a_break_fires_after_a_full_work_interval() {
+        let mut e = Engine::new();
+        run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        assert_eq!(e.state(), State::OnBreak);
+    }
+
+    #[test]
+    fn firing_a_break_emits_show_overlay() {
+        let mut e = Engine::new();
+        let mut t = 0;
+        let mut cmds = Vec::new();
+        for _ in 0..WORK_INTERVAL_SECS {
+            t += TICK_MS;
+            cmds = e.tick(typing(), t, t);
+        }
+        assert!(cmds.contains(&Command::ShowOverlay));
+    }
+
+    #[test]
+    fn the_overlay_is_suppressed_while_presenting() {
+        let mut e = Engine::new();
+        let t = run(&mut e, presenting(), WORK_INTERVAL_SECS, 0);
+        assert_eq!(e.state(), State::BreakDue, "must not ambush a presentation");
+        run(&mut e, presenting(), 60, t);
+        assert_eq!(e.state(), State::BreakDue);
+    }
+
+    #[test]
+    fn deferral_gives_up_and_notifies_after_the_limit() {
+        let mut e = Engine::new();
+        let mut t = run(&mut e, presenting(), WORK_INTERVAL_SECS, 0);
+        let mut saw_notify = false;
+        for _ in 0..DEFER_LIMIT_SECS {
+            t += TICK_MS;
+            if e.tick(presenting(), t, t).iter().any(|c| matches!(c, Command::Notify { .. })) {
+                saw_notify = true;
+            }
+        }
+        assert!(saw_notify, "a long call must not silently disable the app");
+        assert_eq!(e.state(), State::Accumulating);
+        assert_eq!(e.bank_secs(), 0);
+    }
+
+    #[test]
+    fn the_overlay_appears_once_presenting_ends() {
+        let mut e = Engine::new();
+        let t = run(&mut e, presenting(), WORK_INTERVAL_SECS, 0);
+        e.tick(typing(), t + TICK_MS, t + TICK_MS);
+        assert_eq!(e.state(), State::OnBreak);
+    }
+
+    #[test]
+    fn the_countdown_completes_only_when_input_stops() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        // Keep typing through the whole break length: the countdown must hold.
+        let t = run(&mut e, typing(), BREAK_LENGTH_SECS + 5, t);
+        assert_eq!(e.state(), State::OnBreak, "typing must hold the countdown");
+        // Now actually look away.
+        run(&mut e, away(), BREAK_LENGTH_SECS, t);
+        assert_eq!(e.state(), State::Accumulating);
+        assert_eq!(e.bank_secs(), 0);
+    }
+
+    #[test]
+    fn a_completed_break_hides_the_overlay() {
+        let mut e = Engine::new();
+        let mut t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        let mut saw_hide = false;
+        for _ in 0..BREAK_LENGTH_SECS {
+            t += TICK_MS;
+            if e.tick(away(), t, t).contains(&Command::HideOverlay) {
+                saw_hide = true;
+            }
+        }
+        assert!(saw_hide);
     }
 
     #[test]
