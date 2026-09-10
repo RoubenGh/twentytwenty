@@ -135,9 +135,15 @@ impl Engine {
             State::BreakDue => {}
         }
 
+        // Re-evaluate BreakDue immediately in the same tick. This is deliberate: it allows
+        // a break to fire on the tick the interval completes, not one tick later.
         if self.state == State::BreakDue {
             if s.presenting {
                 self.defer_secs += step;
+                // Use strictly-greater-than (not >=) because the transition into BreakDue
+                // runs this same block in the same tick, so defer_secs is already 1 before
+                // any real deferral time has elapsed. This fires at exactly DEFER_LIMIT_SECS
+                // of real deferral, not at DEFER_LIMIT_SECS - 1.
                 if self.defer_secs > DEFER_LIMIT_SECS {
                     cmds.push(Command::Notify {
                         title: "Time to rest your eyes".into(),
