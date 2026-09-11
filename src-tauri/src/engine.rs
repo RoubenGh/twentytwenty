@@ -44,6 +44,9 @@ pub struct Engine {
     break_remaining: u64,
     defer_secs: u64,
     paused_until_ms: Option<u64>,
+    /// Set when a manual break was started from `Paused`, so the break ends
+    /// back in `Paused` instead of silently cancelling the pause.
+    resume_paused_after_break: bool,
     last_mono_ms: Option<u64>,
     last_wall_ms: Option<u64>,
 }
@@ -58,6 +61,7 @@ impl Engine {
             break_remaining: 0,
             defer_secs: 0,
             paused_until_ms: None,
+            resume_paused_after_break: false,
             last_mono_ms: None,
             last_wall_ms: None,
         }
@@ -170,25 +174,46 @@ impl Engine {
         cmds
     }
 
-    pub fn on_user(&mut self, ev: UserEvent, now_ms: u64) -> Vec<Command> {
+    /// Applies a tray/overlay-driven user action.
+    ///
+    /// `wall_ms` is WALL-CLOCK milliseconds, unlike `tick`'s monotonic
+    /// `now_ms`, and that difference is deliberate: the only thing it is used
+    /// for is the "Pause for 1 hour" deadline, which is compared against
+    /// `tick`'s own `wall_ms` argument. Pause deadlines are wall-clock by
+    /// design, so that pausing for an hour and then suspending the machine
+    /// for that hour still un-pauses on resume. Feeding a monotonic value in
+    /// here would make the deadline land in the past on the very next tick
+    /// and expire the pause immediately.
+    ///
+    /// Every arm that can leave `OnBreak` must emit `HideOverlay`: the
+    /// overlay is a fullscreen, always-on-top, click-swallowing window and
+    /// nothing else takes it down. Arms that are a no-op in the current state
+    /// deliberately leave the overlay alone, because they also leave the
+    /// break running.
+    pub fn on_user(&mut self, ev: UserEvent, wall_ms: u64) -> Vec<Command> {
         let mut cmds = Vec::new();
         match ev {
-            UserEvent::Snooze => {
+            // Only meaningful while a break is on screen or pending. From
+            // `Accumulating` this used to set `Snoozed`, which makes the
+            // snooze timer run and fires a break after SNOOZE_LENGTH_SECS:
+            // the item that promises to postpone a break would bring one
+            // forward instead.
+            UserEvent::Snooze if matches!(self.state, State::OnBreak | State::BreakDue) => {
                 self.state = State::Snoozed;
-                self.snooze_secs = 0;
-                self.away_secs = 0;
-                self.break_remaining = 0;
+                self.reset_episode();
                 cmds.push(Command::HideOverlay);
             }
             UserEvent::Skip => {
                 self.state = State::Accumulating;
                 self.bank_secs = 0;
-                self.away_secs = 0;
-                self.snooze_secs = 0;
-                self.break_remaining = 0;
+                self.reset_episode();
                 cmds.push(Command::HideOverlay);
             }
             UserEvent::BreakNow => {
+                // A manual break taken while paused must not quietly cancel
+                // the pause: `finish_break` reads this and goes back to
+                // `Paused` (with its deadline, if any, untouched).
+                self.resume_paused_after_break = self.state == State::Paused;
                 self.state = State::OnBreak;
                 self.break_remaining = BREAK_LENGTH_SECS;
                 cmds.push(Command::ShowOverlay);
@@ -199,29 +224,47 @@ impl Engine {
             UserEvent::Pause { for_ms } => {
                 self.state = State::Paused;
                 self.bank_secs = 0;
-                self.away_secs = 0;
-                self.snooze_secs = 0;
-                self.break_remaining = 0;
-                self.paused_until_ms = for_ms.map(|d| now_ms + d);
+                self.reset_episode();
+                self.paused_until_ms = for_ms.map(|d| wall_ms + d);
                 cmds.push(Command::HideOverlay);
             }
-            UserEvent::Resume => {
+            // Only meaningful while paused. From any other state this wiped
+            // `bank_secs`, silently throwing away up to a full work interval
+            // of accumulated screen time.
+            UserEvent::Resume if self.state == State::Paused => {
                 self.state = State::Accumulating;
                 self.paused_until_ms = None;
                 self.bank_secs = 0;
-                self.away_secs = 0;
+                self.reset_episode();
+                cmds.push(Command::HideOverlay);
             }
+            // Snooze while not on/awaiting a break, Resume while not paused.
+            UserEvent::Snooze | UserEvent::Resume => {}
         }
         cmds.push(Command::TrayStatus(self.tray_status()));
         cmds
     }
 
     fn finish_break(&mut self, cmds: &mut Vec<Command>) {
-        self.state = State::Accumulating;
+        self.state = if self.resume_paused_after_break {
+            State::Paused
+        } else {
+            State::Accumulating
+        };
         self.bank_secs = 0;
-        self.away_secs = 0;
-        self.break_remaining = 0;
+        self.reset_episode();
         cmds.push(Command::HideOverlay);
+    }
+
+    /// Clears the per-episode counters (and the pause-return flag) that every
+    /// state change shares. `bank_secs` is deliberately NOT touched here:
+    /// which events keep the accumulated screen time differs per event, so
+    /// each arm decides that for itself.
+    fn reset_episode(&mut self) {
+        self.away_secs = 0;
+        self.snooze_secs = 0;
+        self.break_remaining = 0;
+        self.resume_paused_after_break = false;
     }
 
     fn tray_status(&self) -> TrayStatus {
@@ -472,6 +515,110 @@ mod tests {
         assert_eq!(e.state(), State::Paused);
         run(&mut e, typing(), 2, t);
         assert_eq!(e.state(), State::Accumulating);
+    }
+
+    /// Every `UserEvent`, applied while a break is on screen. The overlay is
+    /// a fullscreen, always-on-top, click-swallowing window that nothing but
+    /// `HideOverlay` takes down, so leaving `OnBreak` without emitting it
+    /// strands it over the user's desktop for up to a full work interval.
+    /// Events that are a no-op in `OnBreak` are allowed to emit nothing --
+    /// they also leave the break (and therefore the overlay) running.
+    #[test]
+    fn every_user_event_that_ends_a_break_hides_the_overlay() {
+        let events = [
+            UserEvent::Snooze,
+            UserEvent::Skip,
+            UserEvent::BreakNow,
+            UserEvent::Pause { for_ms: None },
+            UserEvent::Pause {
+                for_ms: Some(60 * TICK_MS),
+            },
+            UserEvent::Resume,
+        ];
+        for ev in events {
+            let mut e = Engine::new();
+            let t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+            assert_eq!(e.state(), State::OnBreak);
+            let cmds = e.on_user(ev, t);
+            if e.state() != State::OnBreak {
+                assert!(
+                    cmds.contains(&Command::HideOverlay),
+                    "{ev:?} left OnBreak without hiding the overlay"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resume_during_a_break_leaves_the_break_running() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        e.on_user(UserEvent::Resume, t);
+        assert_eq!(e.state(), State::OnBreak, "Resume is not a break dismissal");
+        // And the break still completes on its own, taking the overlay with it.
+        let mut saw_hide = false;
+        let mut t = t;
+        for _ in 0..BREAK_LENGTH_SECS {
+            t += TICK_MS;
+            if e.tick(away(), t, t).contains(&Command::HideOverlay) {
+                saw_hide = true;
+            }
+        }
+        assert!(saw_hide);
+        assert_eq!(e.state(), State::Accumulating);
+    }
+
+    #[test]
+    fn resume_while_working_keeps_the_bank() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), 600, 0);
+        e.on_user(UserEvent::Resume, t);
+        assert_eq!(e.state(), State::Accumulating);
+        assert_eq!(e.bank_secs(), 600, "Resume must not throw away screen time");
+    }
+
+    #[test]
+    fn resume_ends_a_pause() {
+        let mut e = Engine::new();
+        e.on_user(UserEvent::Pause { for_ms: None }, 0);
+        e.on_user(UserEvent::Resume, 0);
+        assert_eq!(e.state(), State::Accumulating);
+        run(&mut e, typing(), 60, 0);
+        assert_eq!(e.bank_secs(), 60, "resuming must start counting again");
+    }
+
+    #[test]
+    fn snooze_while_working_does_not_bring_a_break_forward() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), 60, 0);
+        e.on_user(UserEvent::Snooze, t);
+        assert_eq!(e.state(), State::Accumulating, "nothing to snooze");
+        assert_eq!(e.bank_secs(), 60);
+        // The snooze length must not become a shortcut to a break.
+        run(&mut e, typing(), SNOOZE_LENGTH_SECS + 5, t);
+        assert_eq!(e.state(), State::Accumulating);
+    }
+
+    #[test]
+    fn a_manual_break_while_paused_goes_back_to_paused() {
+        let mut e = Engine::new();
+        e.on_user(UserEvent::Pause { for_ms: None }, 0);
+        e.on_user(UserEvent::BreakNow, 0);
+        assert_eq!(e.state(), State::OnBreak);
+        let t = run(&mut e, away(), BREAK_LENGTH_SECS, 0);
+        assert_eq!(e.state(), State::Paused, "a manual break must not un-pause");
+        run(&mut e, typing(), 600, t);
+        assert_eq!(e.bank_secs(), 0, "still paused, still not counting");
+    }
+
+    #[test]
+    fn a_manual_break_while_working_returns_to_accumulating() {
+        let mut e = Engine::new();
+        let t = run(&mut e, typing(), 600, 0);
+        e.on_user(UserEvent::BreakNow, t);
+        run(&mut e, away(), BREAK_LENGTH_SECS, t);
+        assert_eq!(e.state(), State::Accumulating);
+        assert_eq!(e.bank_secs(), 0, "a manual break restarts the interval");
     }
 
     #[test]

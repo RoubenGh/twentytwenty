@@ -250,12 +250,27 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 _ => None,
             };
             if let Some(ev) = ev {
-                let cmds = {
-                    let state = handle.state::<AppState>();
-                    let mut engine = state.engine.lock().unwrap();
-                    engine.on_user(ev, wall_ms())
-                };
-                dispatch(handle, cmds);
+                // This closure runs on the main event-loop thread, and
+                // `dispatch` reaches `WebviewWindowBuilder::build()` (via
+                // `overlay::show`), which Tauri's own doc comment says
+                // deadlocks on Windows when called on the main thread from
+                // inside an event handler. A deadlock here is unrecoverable
+                // for the user: the tray stops responding and the app has no
+                // window, so the only way out is Task Manager. Do the work on
+                // a worker thread instead, exactly as the sensing loop does.
+                //
+                // The engine `MutexGuard` is still confined to its own inner
+                // block and dropped before `dispatch`, so the lock is never
+                // held across overlay/tray work.
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    let cmds = {
+                        let state = handle.state::<AppState>();
+                        let mut engine = state.engine.lock().unwrap();
+                        engine.on_user(ev, wall_ms())
+                    };
+                    dispatch(&handle, cmds);
+                });
             }
         })
         .build(app)?;
