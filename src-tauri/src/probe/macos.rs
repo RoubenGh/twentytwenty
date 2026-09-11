@@ -4,9 +4,15 @@
 //! involved in this project). Built against the `core-graphics` crate for idle
 //! time and `pmset` for display assertion state.
 //!
-//! Idle time is read from `CGEventSource::seconds_since_last_event_type`, which
+//! Idle time is read from `CGEventSourceSecondsSinceLastEventType`, which
 //! returns a float in seconds (already the correct unit, unlike Windows which
-//! returns milliseconds). Display-awake and presentation states are read by
+//! returns milliseconds). The `core-graphics` crate (0.24) does not wrap this
+//! particular C function, so it is declared here directly against Apple's
+//! `CGEventSource.h`; everything else it touches (`CGEventSourceStateID`,
+//! `CGEventType`) does come from the crate's safe, `#[repr(C)]`/`#[repr(u32)]`
+//! types, so only the one function call is `unsafe`.
+//!
+//! Display-awake and presentation states are read by
 //! shelling out to `pmset -g assertions` and caching for five seconds. This is
 //! a deliberate trade of elegance for legibility: IOKit-based `IOPMAssertion`
 //! queries would require FFI we cannot run and verify, and getting that
@@ -36,12 +42,25 @@
 
 use super::{parse_pmset_assertions, ActivityProbe, Sample};
 use core_graphics::event::CGEventType;
-use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use core_graphics::event_source::CGEventSourceStateID;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use log;
 
 const ASSERTION_POLL: Duration = Duration::from_secs(5);
+
+// `core-graphics` 0.24 exposes `CGEventSourceStateID` and `CGEventType` (both
+// `#[repr(C)]`/`#[repr(u32)]`, matching the C ABI) but does not wrap
+// `CGEventSourceSecondsSinceLastEventType` itself, so it is declared here
+// directly against Apple's `CGEventSource.h`:
+//   `double CGEventSourceSecondsSinceLastEventType(CGEventSourceStateID, CGEventType)`
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(
+        state_id: CGEventSourceStateID,
+        event_type: CGEventType,
+    ) -> f64;
+}
 
 pub struct MacosProbe {
     cached_assertions: Option<(Instant, bool, bool)>,
@@ -100,10 +119,16 @@ impl MacosProbe {
 
 impl ActivityProbe for MacosProbe {
     fn sample(&mut self) -> anyhow::Result<Sample> {
-        let idle = CGEventSource::seconds_since_last_event_type(
-            CGEventSourceStateID::CombinedSessionState,
-            CGEventType::Null,
-        );
+        // Safety: `CGEventSourceSecondsSinceLastEventType` is a pure query with
+        // no preconditions beyond linking against the CoreGraphics framework
+        // (declared above); it takes plain-old-data arguments and returns a
+        // `double`, no pointers or lifetimes involved.
+        let idle = unsafe {
+            CGEventSourceSecondsSinceLastEventType(
+                CGEventSourceStateID::CombinedSessionState,
+                CGEventType::Null,
+            )
+        };
         let (display_held_awake, presenting) = self.assertions();
         Ok(Sample {
             idle_seconds: idle as u64,
