@@ -3,9 +3,18 @@ use crate::engine::{Command as EngineCmd, Engine, TrayStatus, UserEvent};
 use crate::probe::{self, ActivityProbe, Sample};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager};
+use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+/// Name of the marker file, in the app's config directory, recording that the
+/// first-run autostart question has already been asked. Its mere presence is
+/// the whole state: contents are never read. Deliberately not a full
+/// settings system -- this project has none by design, and one bit doesn't
+/// need one.
+const AUTOSTART_ASKED_FILE: &str = "autostart-asked";
 
 pub struct AppState {
     pub engine: Mutex<Engine>,
@@ -78,7 +87,13 @@ fn update_tray(handle: &AppHandle, status: TrayStatus) {
     let tip = match status {
         TrayStatus::Working { bank_secs } => {
             let left = WORK_INTERVAL_SECS.saturating_sub(bank_secs);
-            format!("TwentyTwenty: {} min until your next break", left / 60 + 1)
+            // Ceiling division: a full 1200-second interval must read as 20
+            // minutes, not 21 (`left / 60 + 1` over-reported by one minute
+            // whenever `left` was an exact multiple of 60).
+            format!(
+                "TwentyTwenty: {} min until your next break",
+                (left + 59) / 60
+            )
         }
         TrayStatus::Break => "TwentyTwenty: look away".to_string(),
         TrayStatus::Snoozed => "TwentyTwenty: snoozed".to_string(),
@@ -89,16 +104,82 @@ fn update_tray(handle: &AppHandle, status: TrayStatus) {
     }
 }
 
+/// Asks, once ever, whether the user wants TwentyTwenty to start
+/// automatically at login. The "already asked" bit lives in a marker file in
+/// the app's config directory (never in the repo, never a full settings
+/// file); a missing or unreadable marker is treated as "not asked yet" so a
+/// one-time filesystem hiccup can't turn into a permanent silent skip in one
+/// direction, and any failure anywhere in this path (resolving the config
+/// dir, showing the dialog, writing the marker, registering autostart) is
+/// logged and swallowed -- this must never be a reason the app fails to
+/// start. Autostart can still be flipped later from the tray menu (see
+/// `build_tray`), so a "No" here is not permanent.
+pub fn maybe_ask_autostart(app: &tauri::App) {
+    let marker = match app.path().app_config_dir() {
+        Ok(dir) => dir.join(AUTOSTART_ASKED_FILE),
+        Err(e) => {
+            log::warn!("could not resolve app config dir, skipping autostart prompt: {e}");
+            return;
+        }
+    };
+
+    if marker.exists() {
+        return;
+    }
+
+    let handle = app.handle().clone();
+    app.dialog()
+        .message("Start TwentyTwenty automatically when you log in?")
+        .title("TwentyTwenty")
+        .buttons(MessageDialogButtons::YesNo)
+        .show(move |yes| {
+            if let Some(parent) = marker.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    log::warn!("could not create app config dir: {e}");
+                }
+            }
+            if let Err(e) = std::fs::write(&marker, b"") {
+                log::warn!("could not persist autostart-asked marker: {e}");
+            }
+
+            if yes {
+                if let Err(e) = handle.autolaunch().enable() {
+                    log::warn!("could not enable autostart: {e}");
+                }
+            }
+        });
+}
+
 pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let break_now = MenuItem::with_id(app, "break_now", "Take a break now", true, None::<&str>)?;
     let snooze = MenuItem::with_id(app, "snooze", "Snooze 5 minutes", true, None::<&str>)?;
     let pause_hour = MenuItem::with_id(app, "pause_hour", "Pause for 1 hour", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause until I resume", true, None::<&str>)?;
     let resume = MenuItem::with_id(app, "resume", "Resume", true, None::<&str>)?;
+    let autostart_enabled = app.autolaunch().is_enabled().unwrap_or_else(|e| {
+        log::warn!("could not read autostart state: {e}");
+        false
+    });
+    let autostart_item = CheckMenuItem::with_id(
+        app,
+        "autostart",
+        "Start at login",
+        true,
+        autostart_enabled,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&break_now, &snooze, &pause_hour, &pause, &resume, &quit],
+        &[
+            &break_now,
+            &snooze,
+            &pause_hour,
+            &pause,
+            &resume,
+            &autostart_item,
+            &quit,
+        ],
     )?;
 
     // `default_window_icon()` is generated at build time from `tauri.conf.json`'s
@@ -131,7 +212,7 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .icon(icon)
         .tooltip("TwentyTwenty")
         .menu(&menu)
-        .on_menu_event(|handle, event| {
+        .on_menu_event(move |handle, event| {
             let ev = match event.id().as_ref() {
                 "break_now" => Some(UserEvent::BreakNow),
                 "snooze" => Some(UserEvent::Snooze),
@@ -140,6 +221,28 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 }),
                 "pause" => Some(UserEvent::Pause { for_ms: None }),
                 "resume" => Some(UserEvent::Resume),
+                "autostart" => {
+                    // Ground truth is always the autostart plugin, not the
+                    // checkbox: toggle it, then set the checkbox to whatever
+                    // the plugin now actually reports, so a failed
+                    // enable/disable can't leave the tray showing a state
+                    // that isn't real.
+                    let autostart = handle.autolaunch();
+                    let currently_enabled = autostart.is_enabled().unwrap_or(false);
+                    let result = if currently_enabled {
+                        autostart.disable()
+                    } else {
+                        autostart.enable()
+                    };
+                    if let Err(e) = result {
+                        log::warn!("could not toggle autostart: {e}");
+                    }
+                    let now_enabled = autostart.is_enabled().unwrap_or(currently_enabled);
+                    if let Err(e) = autostart_item.set_checked(now_enabled) {
+                        log::warn!("could not update autostart menu item: {e}");
+                    }
+                    None
+                }
                 "quit" => {
                     handle.exit(0);
                     None

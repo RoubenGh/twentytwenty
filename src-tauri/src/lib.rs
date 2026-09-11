@@ -5,7 +5,7 @@ pub mod overlay;
 pub mod probe;
 
 use tauri::{Listener, Manager};
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -17,6 +17,7 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_dialog::init())
         .manage(app::AppState {
             engine: std::sync::Mutex::new(engine::Engine::new()),
         })
@@ -31,12 +32,11 @@ pub fn run() {
 
             app::build_tray(app)?;
 
-            let autostart = app.autolaunch();
-            if let Ok(false) = autostart.is_enabled() {
-                if let Err(e) = autostart.enable() {
-                    log::warn!("could not enable autostart: {e}");
-                }
-            }
+            // Ask, once, whether the user wants autostart -- never enable it
+            // silently, and never ask again regardless of the answer. See
+            // `app::maybe_ask_autostart` for the persisted "already asked"
+            // marker and failure handling.
+            app::maybe_ask_autostart(app);
 
             app::spawn_loop(app.handle().clone());
 
