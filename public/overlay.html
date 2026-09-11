@@ -1,0 +1,96 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>TwentyTwenty</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: rgba(8, 10, 14, 0.88);
+    color: #f4f6fb;
+    font: 400 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: grid; place-items: center;
+    -webkit-user-select: none; user-select: none;
+  }
+  /* Invisibility is a forbidden failure mode here: this is a fullscreen,
+     input-blocking window, so if it ever fails to render, it must fail
+     VISIBLE (an odd-looking but dismissible screen) rather than invisible
+     (an unexplained click/keyboard trap with nothing on screen -- exactly
+     what shipped originally, when `opacity: 0` was set on both `html` and
+     `body` and only `body` was ever restored to 1; opacity multiplies down
+     the render tree, so the effective opacity stayed 0 no matter what `body`
+     did). The fade-in is therefore a pure CSS animation on `body` alone,
+     with `html` left at its default opaque state as a backstop: it runs
+     whether or not any JavaScript ever executes, so a broken/slow script
+     still leaves a fully visible, dismissible overlay after 400ms.
+  */
+  body { animation: fade-in 400ms ease forwards; }
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .wrap { text-align: center; }
+  .ring { width: 168px; height: 168px; margin: 0 auto 32px; }
+  .ring circle { fill: none; stroke-width: 8; }
+  .track { stroke: rgba(255,255,255,0.12); }
+  .bar {
+    stroke: #6ee7b7; stroke-linecap: round;
+    transform: rotate(-90deg); transform-origin: 50% 50%;
+    transition: stroke-dashoffset 1s linear;
+  }
+  .count {
+    font-size: 44px; font-weight: 600; fill: #f4f6fb;
+    font-variant-numeric: tabular-nums;
+  }
+  h1 { font-size: 30px; font-weight: 600; margin: 0 0 10px; letter-spacing: -0.01em; }
+  p { margin: 0 0 36px; color: rgba(244,246,251,0.62); }
+  .held { color: #fbbf24; min-height: 1.5em; margin: -24px 0 24px; font-size: 14px; }
+  button {
+    font: inherit; color: inherit; cursor: pointer;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.16);
+    border-radius: 10px; padding: 10px 20px; margin: 0 6px;
+  }
+  button:hover { background: rgba(255,255,255,0.14); }
+</style>
+<div class="wrap">
+  <svg class="ring" viewBox="0 0 120 120">
+    <circle class="track" cx="60" cy="60" r="54" />
+    <circle class="bar" id="bar" cx="60" cy="60" r="54"
+            stroke-dasharray="339.292" stroke-dashoffset="0" />
+    <text class="count" id="count" x="60" y="60"
+          text-anchor="middle" dominant-baseline="central"></text>
+  </svg>
+  <h1>Look 20 feet away</h1>
+  <p>Rest your eyes for a bit. Blink a few times.</p>
+  <div class="held" id="held"></div>
+  <button id="snooze">Snooze 5 min (Esc)</button>
+  <button id="skip">Skip</button>
+</div>
+<script type="module">
+  const { listen, emit } = window.__TAURI__.event;
+  const CIRC = 339.292;
+  const bar = document.getElementById("bar");
+  const count = document.getElementById("count");
+  const held = document.getElementById("held");
+  // The break length is a backend config constant (config::BREAK_LENGTH_SECS),
+  // not hardcoded here: the ring's denominator is learned from the largest
+  // `remaining` value seen so far, which is the first tick of the break.
+  let total = null;
+  let last = null;
+
+  listen("tt://tick", (e) => {
+    const remaining = e.payload;
+    if (total === null || remaining > total) total = remaining;
+    count.textContent = String(remaining);
+    const frac = total > 0 ? remaining / total : 0;
+    bar.setAttribute("stroke-dashoffset", String(CIRC * (1 - frac)));
+    held.textContent = remaining === last ? "Stop typing to start the countdown" : "";
+    last = remaining;
+  });
+
+  document.getElementById("snooze").onclick = () => emit("tt://snooze");
+  document.getElementById("skip").onclick = () => emit("tt://skip");
+  addEventListener("keydown", (e) => {
+    if (e.key === "Escape") emit("tt://snooze");
+  });
+</script>

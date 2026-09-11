@@ -1,0 +1,56 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            args: ""
+          - os: windows-latest
+            args: ""
+          - os: macos-latest
+            args: "--target universal-apple-darwin"
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libxdo-dev
+      - run: pnpm install
+      # No `includeUpdaterJson` and no signing key: this app does not embed
+      # Tauri's updater plugin, so publishing a `latest.json` would advertise
+      # an update channel that no installed copy ever polls. Turning the
+      # channel on again means adding `tauri-plugin-updater` (dependency,
+      # `.plugin()` registration and a startup check), restoring
+      # `bundle.createUpdaterArtifacts` and `plugins.updater` in
+      # `tauri.conf.json`, and putting the signing env vars and
+      # `includeUpdaterJson: true` back here -- in that order, app first.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "TwentyTwenty ${{ github.ref_name }}"
+          releaseBody: "Unsigned builds. See the README for the one-time Windows and macOS bypass."
+          releaseDraft: false
+          args: ${{ matrix.args }}
