@@ -3,9 +3,9 @@ use crate::engine::{Command as EngineCmd, Engine, TrayStatus, UserEvent};
 use crate::probe::{self, ActivityProbe, Sample};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::menu::{CheckMenuItem, Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
@@ -19,6 +19,12 @@ const AUTOSTART_ASKED_FILE: &str = "autostart-asked";
 pub struct AppState {
     pub engine: Mutex<Engine>,
 }
+
+/// Handle to the tray menu's first entry, a disabled item used purely as a
+/// live readout ("Next break in 12:34"). Managed separately from `AppState`
+/// because the menu does not exist until `build_tray` runs, which is after
+/// the engine is managed in `lib.rs`.
+pub struct TrayStatusLine(pub Mutex<MenuItem<Wry>>);
 
 pub(crate) fn wall_ms() -> u64 {
     SystemTime::now()
@@ -91,6 +97,25 @@ pub fn dispatch(handle: &AppHandle, cmds: Vec<EngineCmd>) {
     }
 }
 
+/// Text for the tray's live readout. Working shows a real countdown in
+/// m:ss so the menu tells you exactly how long you have, not a rounded
+/// "12 min" that sits unchanged for a minute at a time.
+fn status_text(status: TrayStatus) -> String {
+    match status {
+        TrayStatus::Working { bank_secs } => {
+            let left = WORK_INTERVAL_SECS.saturating_sub(bank_secs);
+            if left == 0 {
+                "Next break: now".to_string()
+            } else {
+                format!("Next break in {}:{:02}", left / 60, left % 60)
+            }
+        }
+        TrayStatus::Break => "Break in progress, look away".to_string(),
+        TrayStatus::Snoozed => "Snoozed, break coming back".to_string(),
+        TrayStatus::Paused => "Paused".to_string(),
+    }
+}
+
 fn update_tray(handle: &AppHandle, status: TrayStatus) {
     let tip = match status {
         TrayStatus::Working { bank_secs } => {
@@ -109,6 +134,20 @@ fn update_tray(handle: &AppHandle, status: TrayStatus) {
     };
     if let Some(tray) = handle.tray_by_id("main") {
         let _ = tray.set_tooltip(Some(&tip));
+    }
+
+    // The menu readout. Hover gives you the tooltip; right-clicking gives you
+    // this, which is the discoverable one. Failure here is never fatal: a
+    // stale countdown is not worth taking the app down for.
+    if let Some(line) = handle.try_state::<TrayStatusLine>() {
+        match line.0.lock() {
+            Ok(item) => {
+                if let Err(e) = item.set_text(status_text(status)) {
+                    log::debug!("could not update tray status line: {e}");
+                }
+            }
+            Err(e) => log::debug!("tray status line mutex poisoned: {e}"),
+        }
     }
 }
 
@@ -159,6 +198,16 @@ pub fn maybe_ask_autostart(app: &tauri::App) {
 }
 
 pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    // A disabled first entry used purely as a live readout. Disabled so it
+    // cannot be clicked or focused; its text is rewritten every tick by
+    // `update_tray` from the same TrayStatus the tooltip uses.
+    let status_line = MenuItem::with_id(
+        app,
+        "status_line",
+        status_text(TrayStatus::Working { bank_secs: 0 }),
+        false,
+        None::<&str>,
+    )?;
     let break_now = MenuItem::with_id(app, "break_now", "Take a break now", true, None::<&str>)?;
     let snooze = MenuItem::with_id(app, "snooze", "Snooze 5 minutes", true, None::<&str>)?;
     let pause_hour = MenuItem::with_id(app, "pause_hour", "Pause for 1 hour", true, None::<&str>)?;
@@ -180,6 +229,8 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let menu = Menu::with_items(
         app,
         &[
+            &status_line,
+            &PredefinedMenuItem::separator(app)?,
             &break_now,
             &snooze,
             &pause_hour,
@@ -189,6 +240,8 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             &quit,
         ],
     )?;
+
+    app.manage(TrayStatusLine(Mutex::new(status_line)));
 
     // `default_window_icon()` is generated at build time from `tauri.conf.json`'s
     // `bundle.icon` list (falling back to `icons/icon.png`/`icons/icon.ico` on
