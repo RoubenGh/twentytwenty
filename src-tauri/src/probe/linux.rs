@@ -127,6 +127,9 @@ pub struct LinuxProbe {
     system_dbus: Option<DbusConnection>,
     wl_queue: EventQueue<IdleState>,
     idle_state: IdleState,
+    // The resolved login1 session object path, cached after the first
+    // successful `LockedHint` read. See `login1_locked_hint`.
+    session_path: Option<zbus::zvariant::OwnedObjectPath>,
     // Held for its whole lifetime: dropping it would stop Idled/Resumed
     // delivery. It is never recreated per sample, per the findings doc.
     _idle_notification: ExtIdleNotificationV1,
@@ -166,6 +169,7 @@ impl LinuxProbe {
             system_dbus,
             wl_queue,
             idle_state,
+            session_path: None,
             _idle_notification: idle_notification,
         };
 
@@ -254,14 +258,41 @@ impl LinuxProbe {
     /// in `sample()` folds that to `false` -- the same value this probe
     /// already reported before `LockedHint` was wired in, so there is no
     /// regression risk.
-    fn login1_locked_hint(&self) -> Result<bool> {
+    ///
+    /// The resolution above runs ONCE and the winning object path is then
+    /// cached for the life of the probe. It used to run on every sample,
+    /// which meant a `GetSessionByPID` that production always fails, a
+    /// `/proc/self/status` read, a `ListSessions`, and an `Active` read per
+    /// candidate -- four or more system-bus round trips every second, to
+    /// re-derive a value that changes a few times a day (a login, a fast user
+    /// switch). That is not just waste: this probe's `sample()` is what paces
+    /// the tick loop, and the engine treats any tick gap over `2 * TICK_MS`
+    /// as time spent away from the desk, so bus contention could manufacture
+    /// phantom away-time and reset a legitimately accumulated bank. Only a
+    /// failed `LockedHint` read invalidates the cache, which is exactly the
+    /// signal that the cached session went away (logged out, switched);
+    /// resolution is then retried once, immediately.
+    fn login1_locked_hint(&mut self) -> Result<bool> {
+        // Cloned (it is an Arc handle internally) so that the cache below can
+        // be mutated while a connection is in hand.
         let system = self
             .system_dbus
             .as_ref()
-            .context("no system D-Bus connection")?;
+            .context("no system D-Bus connection")?
+            .clone();
+
+        if let Some(path) = self.session_path.clone() {
+            match Self::read_locked_hint(&system, &path) {
+                Ok(locked) => return Ok(locked),
+                Err(e) => {
+                    log::debug!("cached login1 session went stale, re-resolving: {e}");
+                    self.session_path = None;
+                }
+            }
+        }
 
         let manager = zbus::blocking::Proxy::new(
-            system,
+            &system,
             "org.freedesktop.login1",
             "/org/freedesktop/login1",
             "org.freedesktop.login1.Manager",
@@ -269,11 +300,20 @@ impl LinuxProbe {
         .context("building the login1 Manager proxy")?;
 
         let session_path = Self::resolve_login1_session(&manager)?;
+        let locked = Self::read_locked_hint(&system, &session_path)?;
+        self.session_path = Some(session_path);
+        Ok(locked)
+    }
 
+    /// Reads `LockedHint` off one already-resolved login1 session path.
+    fn read_locked_hint(
+        system: &DbusConnection,
+        session_path: &zbus::zvariant::OwnedObjectPath,
+    ) -> Result<bool> {
         let session = zbus::blocking::Proxy::new(
             system,
             "org.freedesktop.login1",
-            &session_path,
+            session_path,
             "org.freedesktop.login1.Session",
         )
         .context("building the login1 Session proxy")?;
