@@ -32,9 +32,14 @@ impl ActivityProbe for WindowsProbe {
         // SAFETY: GetTickCount64 takes no arguments and has no preconditions;
         // it simply returns the system tick count as a u64.
         let now = unsafe { GetTickCount64() };
-        // GetTickCount64 returns milliseconds since boot; convert to seconds,
-        // saturating on underflow (clock drift safety).
-        let idle_seconds = now.saturating_sub(u64::from(info.dwTime)) / 1000;
+        // `LASTINPUTINFO::dwTime` is a 32-bit tick count that WRAPS roughly
+        // every 49.7 days of uptime; `GetTickCount64` does not. Subtracting
+        // them as 64-bit values gives a nonsense ~4.29-million-second idle
+        // time for the ~49.7 days following each wrap. Truncate the 64-bit
+        // clock to 32 bits and subtract in that same wrapping space, which is
+        // correct on both sides of a wrap for any real idle duration (the
+        // difference only has to fit in 32 bits, i.e. be under 49.7 days).
+        let idle_seconds = u64::from((now as u32).wrapping_sub(info.dwTime)) / 1000;
 
         // SAFETY: no arguments, returns a plain enum.
         let state = unsafe { SHQueryUserNotificationState() }?;

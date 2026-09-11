@@ -27,11 +27,17 @@ pub(crate) fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Runs the sensing loop forever. A probe error, or an implausible sample
-/// (more idle time than a real desktop session could produce), downgrades
-/// the rest of the session to the fallback probe rather than killing the
-/// loop. Idle time falling back down is normal (the user just gave input)
-/// and must never trigger a downgrade.
+/// Runs the sensing loop forever. A probe error downgrades the rest of the
+/// session to the fallback probe rather than killing the loop. An
+/// implausibly large idle reading is NOT an error: it is clamped to
+/// `MAX_PLAUSIBLE_IDLE_SECS` and the working probe is kept, because the
+/// honest causes of one (a machine left idle over a weekend with sleep
+/// disabled, a wrapped platform counter) are not evidence that the probe has
+/// stopped working, and permanently downgrading to the input-idle-only
+/// fallback would silently turn this app into the plain timer it exists not
+/// to be. Every value above `ACTIVE_GRACE_SECS` is identical to the engine
+/// anyway. Idle time falling back down is normal (the user just gave input)
+/// and must never trigger a downgrade either.
 pub fn spawn_loop(handle: AppHandle) {
     std::thread::spawn(move || {
         let mut probe: Box<dyn ActivityProbe> = probe::select();
@@ -42,15 +48,17 @@ pub fn spawn_loop(handle: AppHandle) {
             std::thread::sleep(Duration::from_millis(TICK_MS));
 
             let sample = match probe.sample() {
-                Ok(s) if s.idle_seconds > MAX_PLAUSIBLE_IDLE_SECS => {
-                    log::warn!(
-                        "probe reported implausible idle time ({}s), downgrading to fallback",
-                        s.idle_seconds
-                    );
-                    probe = Box::new(crate::probe::fallback::FallbackProbe::new());
-                    Sample::default()
+                Ok(mut s) => {
+                    if s.idle_seconds > MAX_PLAUSIBLE_IDLE_SECS {
+                        log::warn!(
+                            "probe reported implausible idle time ({}s), clamping to {}s",
+                            s.idle_seconds,
+                            MAX_PLAUSIBLE_IDLE_SECS
+                        );
+                        s.idle_seconds = s.idle_seconds.min(MAX_PLAUSIBLE_IDLE_SECS);
+                    }
+                    s
                 }
-                Ok(s) => s,
                 Err(e) => {
                     log::warn!("probe failed, downgrading to fallback: {e}");
                     probe = Box::new(crate::probe::fallback::FallbackProbe::new());

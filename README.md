@@ -5,7 +5,7 @@ eye strain: every 20 minutes of screen time, look at something 20 feet away
 for 20 seconds. It lives in the tray, does its counting, and gets out of the
 way otherwise.
 
-Downloads: [github.com/RoubenGh/twentytwenty/releases/tag/v0.1.0](https://github.com/RoubenGh/twentytwenty/releases/tag/v0.1.0)
+Downloads: [github.com/RoubenGh/twentytwenty/releases/tag/v0.1.1](https://github.com/RoubenGh/twentytwenty/releases/tag/v0.1.1)
 
 ## Why this is not a plain 20-minute timer
 
@@ -89,17 +89,17 @@ past it.
 
 ### Linux
 
-Download from the [release page](https://github.com/RoubenGh/twentytwenty/releases/tag/v0.1.0):
+Download from the [release page](https://github.com/RoubenGh/twentytwenty/releases/tag/v0.1.1):
 
-- `.deb` (Debian/Ubuntu): `sudo dpkg -i TwentyTwenty_0.1.0_amd64.deb`
-- `.rpm` (Fedora/openSUSE): `sudo rpm -i TwentyTwenty-0.1.0-1.x86_64.rpm`
-- `.AppImage` (any distro): `chmod +x TwentyTwenty_0.1.0_amd64.AppImage && ./TwentyTwenty_0.1.0_amd64.AppImage`
+- `.deb` (Debian/Ubuntu): `sudo dpkg -i TwentyTwenty_0.1.1_amd64.deb`
+- `.rpm` (Fedora/openSUSE): `sudo rpm -i TwentyTwenty-0.1.1-1.x86_64.rpm`
+- `.AppImage` (any distro): `chmod +x TwentyTwenty_0.1.1_amd64.AppImage && ./TwentyTwenty_0.1.1_amd64.AppImage`
 
 No bypass is needed on Linux.
 
 ### Windows
 
-Download `TwentyTwenty_0.1.0_x64-setup.exe` (or `TwentyTwenty_0.1.0_x64_en-US.msi`) and run it.
+Download `TwentyTwenty_0.1.1_x64-setup.exe` (or `TwentyTwenty_0.1.1_x64_en-US.msi`) and run it.
 Windows SmartScreen will say "Windows protected your PC." Click **More
 info**, then **Run anyway**. This appears because the installer isn't signed
 with a paid Microsoft code-signing certificate, not because of anything
@@ -110,7 +110,7 @@ Verification status below before relying on it.
 
 ### macOS
 
-Download `TwentyTwenty_0.1.0_universal.dmg`, open it, and drag TwentyTwenty
+Download `TwentyTwenty_0.1.1_universal.dmg`, open it, and drag TwentyTwenty
 to Applications. Gatekeeper will refuse to open it ("cannot be opened
 because the developer cannot be verified"). Clear the quarantine flag from
 a terminal:
