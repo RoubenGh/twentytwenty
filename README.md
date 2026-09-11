@@ -177,6 +177,27 @@ is the first real-world test of that platform's sensing.
   silently no-ops them, and Wayland's core protocol has no client-side
   equivalent at all (hiding a window from the taskbar is deliberately the
   compositor's decision, not an app's). Not fixable from this codebase.
+- **The break overlay does not reliably cover the KDE panel on Wayland**,
+  and the panel is visible (and undimmed) at the bottom of the screen during
+  a break on this project's KDE Plasma 6.7.4 / Wayland test machine. This
+  contradicts the original spike finding in
+  `docs/findings/2026-09-10-wayland-overlay.md`, which was based on a
+  screenshot comparison; a later re-test using KWin's own window
+  introspection (not a screenshot) found that the overlay window never
+  actually reaches a genuine fullscreen state at the compositor level,
+  reporting as a small, ordinary, centered window (`fullScreen: false`,
+  `keepAbove: false`) to KWin even though Tauri's own API reports the
+  opposite (`is_fullscreen(): true`, correct size and position). This is
+  very likely the same root cause as the taskbar item above: GTK's Wayland
+  backend accepts and reports success for these window hints
+  (fullscreen, always-on-top, skip-taskbar) without them reliably reaching
+  the compositor as the real states they're supposed to produce. See the
+  findings doc's 2026-09-11 update for the full re-test. No fix was
+  attempted beyond one ruled-out candidate (requesting fullscreen as a
+  builder-time attribute instead of after the window is built), since it
+  made no measurable difference and a proper fix (a `wlr-layer-shell`
+  surface, or a KWin-specific window rule) is a larger change than this
+  release's scope.
 - **macOS lock detection is not implemented**, and `locked` is hardcoded to
   `false` on that platform. Real lock detection would require either a
   private, undocumented API (`CGSSessionScreenIsLocked`) or IOKit FFI, and
