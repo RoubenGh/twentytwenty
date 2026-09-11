@@ -18,7 +18,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# `macos-private-api` is required for WebviewWindowBuilder::transparent
+# (src/overlay.rs) to exist on macOS at all; tauri-build's manifest check
+# also requires this feature to be declared unconditionally whenever
+# `app.macOSPrivateApi` is set in tauri.conf.json, regardless of the host
+# platform actually being compiled for. The feature is a no-op on
+# Linux/Windows: it only gates macOS-specific code paths inside tauri
+# itself. This opts the app out of Mac App Store distribution, which does
+# not apply here: builds ship as unsigned installers from GitHub Releases.
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
