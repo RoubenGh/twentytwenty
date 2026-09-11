@@ -212,8 +212,20 @@ impl Engine {
             UserEvent::BreakNow => {
                 // A manual break taken while paused must not quietly cancel
                 // the pause: `finish_break` reads this and goes back to
-                // `Paused` (with its deadline, if any, untouched).
-                self.resume_paused_after_break = self.state == State::Paused;
+                // `Paused` (with its deadline, if any, untouched). Only
+                // compute the flag when not already on a break: BreakNow is
+                // reachable while OnBreak (the tray item stays enabled), and
+                // recomputing against the current state there would read
+                // `OnBreak`, not the original `Paused`, and silently erase
+                // the captured intent.
+                if self.state != State::OnBreak {
+                    self.resume_paused_after_break = self.state == State::Paused;
+                }
+                // A repeated BreakNow while already OnBreak restarts the
+                // countdown (break_remaining is unconditionally reset below)
+                // rather than being a no-op: each click means "a full break
+                // starts now," which is simpler to reason about than a
+                // no-op that has to special-case "already on a break."
                 self.state = State::OnBreak;
                 self.break_remaining = BREAK_LENGTH_SECS;
                 cmds.push(Command::ShowOverlay);
@@ -607,6 +619,23 @@ mod tests {
         assert_eq!(e.state(), State::OnBreak);
         let t = run(&mut e, away(), BREAK_LENGTH_SECS, 0);
         assert_eq!(e.state(), State::Paused, "a manual break must not un-pause");
+        run(&mut e, typing(), 600, t);
+        assert_eq!(e.bank_secs(), 0, "still paused, still not counting");
+    }
+
+    #[test]
+    fn a_reentrant_break_now_during_a_paused_originated_break_still_returns_to_paused() {
+        let mut e = Engine::new();
+        e.on_user(UserEvent::Pause { for_ms: None }, 0);
+        e.on_user(UserEvent::BreakNow, 0);
+        assert_eq!(e.state(), State::OnBreak);
+        // Reentrant: "Take a break now" clicked again mid-break. This must
+        // not recompute resume_paused_after_break against the now-current
+        // OnBreak state and overwrite the paused intent captured above.
+        e.on_user(UserEvent::BreakNow, 0);
+        assert_eq!(e.state(), State::OnBreak);
+        let t = run(&mut e, away(), BREAK_LENGTH_SECS, 0);
+        assert_eq!(e.state(), State::Paused, "a reentrant manual break must not un-pause");
         run(&mut e, typing(), 600, t);
         assert_eq!(e.bank_secs(), 0, "still paused, still not counting");
     }

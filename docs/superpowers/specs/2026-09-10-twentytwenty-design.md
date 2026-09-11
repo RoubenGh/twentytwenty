@@ -246,6 +246,19 @@ first-install warnings on Windows and macOS.
 The update channel deliberately does not depend on the portfolio site, so a
 portfolio redeploy can never break an installed app's updater.
 
+> **Superseded, 2026-09-10 (before the first release).** The two paragraphs
+> above describe the updater as originally designed; they are kept as a
+> record of that decision, not as current behavior. The self-updater was
+> removed before shipping: the `tauri-plugin-updater` plugin was never
+> installed, and Tauri's updater can only swap the running binary, so it
+> cannot update the `.deb`/`.rpm` packages the README steers Linux users
+> toward -- an updater that works on some platforms and silently does
+> nothing on others is worse than no updater. Distribution is GitHub
+> Releases only; there is no update channel, and the app does not check for
+> updates. The reasoning for turning it back on, and the exact steps to do
+> so, live as a comment above the release job in
+> `.github/workflows/release.yml`.
+
 ## 11. Testing
 
 - **Engine unit tests** carry the bulk of the verification. Synthetic `Sample`
