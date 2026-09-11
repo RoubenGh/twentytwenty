@@ -42,6 +42,9 @@ pub struct Engine {
     away_secs: u64,
     snooze_secs: u64,
     break_remaining: u64,
+    /// Real seconds the overlay has been on screen this break, counted
+    /// regardless of input. Bounds the `BREAK_INPUT_GRACE_SECS` hold below.
+    break_on_screen_secs: u64,
     defer_secs: u64,
     paused_until_ms: Option<u64>,
     /// Set when a manual break was started from `Paused`, so the break ends
@@ -59,6 +62,7 @@ impl Engine {
             away_secs: 0,
             snooze_secs: 0,
             break_remaining: 0,
+            break_on_screen_secs: 0,
             defer_secs: 0,
             paused_until_ms: None,
             resume_paused_after_break: false,
@@ -103,7 +107,15 @@ impl Engine {
                 if s.idle_seconds >= BREAK_INPUT_GRACE_SECS {
                     self.break_remaining = self.break_remaining.saturating_sub(step);
                 }
-                if self.break_remaining == 0 {
+                // Counted unconditionally, unlike `break_remaining`: this is
+                // the ceiling that makes the input hold above bounded. Without
+                // it, a user who never stops touching the machine holds a
+                // fullscreen, always-on-top, click-swallowing window open
+                // forever, with no exit short of killing the process.
+                self.break_on_screen_secs += step;
+                if self.break_remaining == 0
+                    || self.break_on_screen_secs >= BREAK_ON_SCREEN_CEILING_SECS
+                {
                     self.finish_break(&mut cmds);
                 } else {
                     cmds.push(Command::UpdateOverlay {
@@ -163,6 +175,7 @@ impl Engine {
             } else {
                 self.state = State::OnBreak;
                 self.break_remaining = BREAK_LENGTH_SECS;
+                self.break_on_screen_secs = 0;
                 cmds.push(Command::ShowOverlay);
                 cmds.push(Command::UpdateOverlay {
                     remaining_secs: BREAK_LENGTH_SECS,
@@ -228,6 +241,7 @@ impl Engine {
                 // no-op that has to special-case "already on a break."
                 self.state = State::OnBreak;
                 self.break_remaining = BREAK_LENGTH_SECS;
+                self.break_on_screen_secs = 0;
                 cmds.push(Command::ShowOverlay);
                 cmds.push(Command::UpdateOverlay {
                     remaining_secs: BREAK_LENGTH_SECS,
@@ -276,6 +290,7 @@ impl Engine {
         self.away_secs = 0;
         self.snooze_secs = 0;
         self.break_remaining = 0;
+        self.break_on_screen_secs = 0;
         self.resume_paused_after_break = false;
     }
 
@@ -417,6 +432,50 @@ mod tests {
             }
         }
         assert!(saw_hide);
+    }
+
+    /// A user who keeps touching the keyboard must not be able to hold the
+    /// overlay on screen forever. The overlay is fullscreen, always-on-top and
+    /// swallows clicks, so an unbounded hold is an input trap with no exit --
+    /// and mashing keys is exactly what someone does when a break surprises
+    /// them, so the pathological input is also the instinctive one. Reported
+    /// from the field as "it completely locks my screen, I have to restart my
+    /// laptop".
+    #[test]
+    fn constant_input_cannot_hold_the_overlay_open_forever() {
+        let mut e = Engine::new();
+        let mut t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        assert_eq!(e.state(), State::OnBreak);
+
+        let mut saw_hide = false;
+        // Twice the ceiling: if the break has not ended by then it never will.
+        for _ in 0..(2 * BREAK_ON_SCREEN_CEILING_SECS) {
+            t += TICK_MS;
+            if e.tick(typing(), t, t).contains(&Command::HideOverlay) {
+                saw_hide = true;
+                break;
+            }
+        }
+        assert!(
+            saw_hide,
+            "the overlay never came down under continuous input: it is an input trap"
+        );
+        assert_ne!(e.state(), State::OnBreak);
+    }
+
+    /// The ceiling is a safety valve, not the normal path: a break taken the
+    /// ordinary way (stop touching the machine, look away) still ends on
+    /// BREAK_LENGTH_SECS, well before the ceiling.
+    #[test]
+    fn the_ceiling_does_not_shorten_an_ordinary_break() {
+        let mut e = Engine::new();
+        let mut t = run(&mut e, typing(), WORK_INTERVAL_SECS, 0);
+        for _ in 0..(BREAK_LENGTH_SECS - 1) {
+            t += TICK_MS;
+            assert!(!e.tick(away(), t, t).contains(&Command::HideOverlay));
+        }
+        t += TICK_MS;
+        assert!(e.tick(away(), t, t).contains(&Command::HideOverlay));
     }
 
     #[test]

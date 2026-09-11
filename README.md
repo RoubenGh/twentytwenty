@@ -290,17 +290,37 @@ The engine and probe-parsing tests are pure and run on any platform:
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-That command runs 42 tests, but CI does not: the accurate version is 40
+That command runs 43 tests, but CI does not: the accurate version is 41
 unit tests (engine, probe parsing, probe selection) that compile and pass
 on all three platforms, plus two D-Bus integration tests in
 `src-tauri/tests/linux_probe.rs` that CI never really runs. That file is
 `#![cfg(target_os = "linux")]`, so the Windows and macOS jobs compile it
-away and run 40. On the Linux job it compiles, but both tests check for
+away and run 41. On the Linux job it compiles, but both tests check for
 `DBUS_SESSION_BUS_ADDRESS` and `WAYLAND_DISPLAY` and return early when
 either is missing, which is always the case on a headless GitHub runner:
 they report as passing without having touched D-Bus at all. The only place
 those two have ever genuinely talked to a session bus and a compositor is
 this project's development machine, where they do pass.
+
+### Building a release binary
+
+Use `pnpm tauri build`. Never `cargo build --release`.
+
+The two are not interchangeable here, and the difference is not the
+optimisation level. Tauri picks where `WebviewUrl::App` resolves from a `cfg`
+flag that tauri-build sets whenever the `tauri` crate is compiled without its
+`custom-protocol` feature. `pnpm tauri build` passes that feature (`cargo build
+--bins --features tauri/custom-protocol --release`); a bare `cargo build
+--release` does not. Without it the frontend is never embedded and the break
+overlay is pointed at `build.devUrl`, which nothing is serving in an installed
+app: you get a fullscreen, always-on-top, click-swallowing window showing
+WebKit's error page, with no script and therefore no Esc handler and no
+buttons. That shipped once; see
+`docs/findings/2026-09-11-overlay-input-trap.md`.
+
+`lib.rs` now fails the build outright if this happens, so you cannot produce
+that binary by accident any more. If you see a `compile_error!` about
+`custom-protocol`, this is why.
 
 Do not run `pnpm tauri dev` casually: it puts a real fullscreen overlay on
 top of whatever you're doing the moment a break interval elapses. If you

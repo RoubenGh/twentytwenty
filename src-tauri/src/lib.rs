@@ -4,6 +4,32 @@ pub mod engine;
 pub mod overlay;
 pub mod probe;
 
+// A release binary built without `tauri/custom-protocol` is a booby trap, not
+// a working app, so refuse to produce one.
+//
+// `cfg(dev)` is set by tauri-build whenever the `tauri` crate is compiled
+// without its `custom-protocol` feature. In that mode Tauri does not embed the
+// frontend at all and resolves `WebviewUrl::App` against `build.devUrl`
+// instead (tauri 2.11.5, `manager/mod.rs::get_app_url`). That is correct under
+// `tauri dev`, where Vite is serving on 1420. In a shipped binary nothing is
+// listening there, so `overlay::show` opens a fullscreen, always-on-top,
+// decorationless, click-swallowing window pointed at a dead URL: WebKit paints
+// its "connection refused" page, no script runs, and the Esc handler and both
+// buttons that would dismiss the overlay never exist. The user cannot click,
+// cannot type past it, and cannot close it.
+//
+// `pnpm tauri build` passes the feature (`cargo build --bins --features
+// tauri/custom-protocol --release`). A bare `cargo build --release` does not,
+// and produced exactly that trap once already. This turns that mistake into a
+// compile error instead of a shipped app.
+#[cfg(all(not(debug_assertions), dev))]
+compile_error!(
+    "release build without `tauri/custom-protocol`: the break overlay would load \
+     build.devUrl (nothing listens there in a shipped binary), leaving a fullscreen \
+     always-on-top window with no script, no Esc handler and no buttons. \
+     Build with `pnpm tauri build`, not `cargo build --release`."
+);
+
 use tauri::{Listener, Manager};
 use tauri_plugin_autostart::MacosLauncher;
 

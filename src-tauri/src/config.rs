@@ -7,6 +7,16 @@ pub const ACTIVE_GRACE_SECS: u64 = 60;
 pub const NATURAL_BREAK_SECS: u64 = 2 * 60;
 pub const SNOOZE_LENGTH_SECS: u64 = 5 * 60;
 pub const BREAK_INPUT_GRACE_SECS: u64 = 2;
+/// Hard ceiling on how long the break overlay may stay on screen, counted in
+/// real seconds from the moment it appears and regardless of what the user is
+/// doing. `BREAK_INPUT_GRACE_SECS` deliberately holds the countdown while
+/// input is still arriving (typing through a break is not resting your eyes),
+/// but that hold must be BOUNDED: the overlay is fullscreen, always-on-top and
+/// swallows clicks, so an unbounded hold is an input trap, and mashing the
+/// keyboard is precisely what a surprised user does. Past this ceiling the
+/// break ends on its own. Generous enough that an ordinary break (finish your
+/// sentence, then look away) never reaches it.
+pub const BREAK_ON_SCREEN_CEILING_SECS: u64 = 90;
 pub const DEFER_LIMIT_SECS: u64 = 10 * 60;
 /// Ceiling applied to a probe's reported idle time. More than this in one
 /// sample is not plausible for a real desktop session, but it is also not
