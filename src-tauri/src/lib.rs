@@ -5,6 +5,7 @@ pub mod overlay;
 pub mod probe;
 
 use tauri::{Listener, Manager};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -12,6 +13,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(app::AppState {
             engine: std::sync::Mutex::new(engine::Engine::new()),
         })
@@ -25,6 +30,14 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             app::build_tray(app)?;
+
+            let autostart = app.autolaunch();
+            if let Ok(false) = autostart.is_enabled() {
+                if let Err(e) = autostart.enable() {
+                    log::warn!("could not enable autostart: {e}");
+                }
+            }
+
             app::spawn_loop(app.handle().clone());
 
             let h = app.handle().clone();
