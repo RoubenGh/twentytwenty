@@ -17,6 +17,22 @@ pub const BREAK_INPUT_GRACE_SECS: u64 = 2;
 /// break ends on its own. Generous enough that an ordinary break (finish your
 /// sentence, then look away) never reaches it.
 pub const BREAK_ON_SCREEN_CEILING_SECS: u64 = 90;
+/// How long the overlay page gets to prove it can paint before the overlay is
+/// abandoned. The break window is fullscreen, always-on-top and swallows
+/// clicks, and every control that dismisses it (Esc, Snooze, Skip) lives in
+/// that page's script, so a window whose content never renders is a total
+/// input trap with no exit. It is therefore created HIDDEN and only promoted
+/// to a real overlay once the page emits `tt://overlay-ready`; if that never
+/// arrives within this budget the windows are destroyed and the break falls
+/// back to a plain notification. A missed break is an inconvenience. A locked
+/// machine is not.
+///
+/// This has fired for real: the AppImage runtime bundles its own EGL/GTK
+/// libraries, and on a host whose driver disagrees WebKit dies with
+/// "Could not create default EGL display: EGL_BAD_PARAMETER. Aborting..."
+/// before a single frame or a single line of JavaScript. See
+/// `docs/findings/2026-09-11-overlay-input-trap.md`.
+pub const OVERLAY_READY_TIMEOUT_MS: u64 = 2_500;
 pub const DEFER_LIMIT_SECS: u64 = 10 * 60;
 /// Ceiling applied to a probe's reported idle time. More than this in one
 /// sample is not plausible for a real desktop session, but it is also not

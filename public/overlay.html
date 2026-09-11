@@ -68,6 +68,19 @@
 </div>
 <script type="module">
   const { listen, emit } = window.__TAURI__.event;
+
+  // Report that this page has actually painted. Until Rust hears this the
+  // overlay window stays hidden, unfocused and not always-on-top, so it
+  // captures nothing (see overlay.rs). Two rAFs, not one: the first fires
+  // before the frame that includes this page is composited, the second
+  // cannot run until that frame has gone out. So reaching this line is
+  // real evidence of a rendered frame, not merely of script execution.
+  //
+  // Deliberately the very first thing the script does. Anything above it
+  // that threw would leave a break with no overlay AND no notification.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    emit("tt://overlay-ready");
+  }));
   const CIRC = 339.292;
   const bar = document.getElementById("bar");
   const count = document.getElementById("count");

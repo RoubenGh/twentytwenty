@@ -122,3 +122,100 @@ by making the property a compile-time one.
 Defect 2 was reachable by the existing pure-engine tests and simply had no test
 asserting it. `every_user_event_that_ends_a_break_hides_the_overlay` covers the
 user-event exits; nothing covered "no user event at all, forever".
+
+---
+
+# Round 2: the same trap, a different cause (same day)
+
+The fixes above were shipped as v0.1.3 and the user hit the trap again within
+the hour: *"i did not see an overlay... and it still locked me out."*
+
+The first write-up was correct but incomplete. It identified one way the page
+can fail to appear and treated fixing that as fixing the trap. It is not the
+same thing.
+
+## Why the v0.1.3 verification was worthless
+
+The overlay was verified by building a variant with `decorations(false)`,
+`always_on_top(true)` and `set_fullscreen(true)` removed, so it could be
+screenshotted without hijacking the tester's screen, and by running the binary
+**directly**. Both choices removed the variable that mattered.
+
+The user launches through the AppImage. `AppRun` does two things a direct run
+does not: it exports `GDK_BACKEND=x11`, and `AppRun.wrapped` prepends the
+bundle's own library directories to `LD_LIBRARY_PATH`. Against a host driver
+that disagrees with those bundled libraries, WebKit dies before its first
+frame:
+
+```
+Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...
+```
+
+Measured, four ways:
+
+| launch | result |
+|---|---|
+| binary directly, native Wayland | renders |
+| binary directly, `GDK_BACKEND=x11` | renders |
+| via `AppRun` | `EGL_BAD_PARAMETER`, blank window |
+| via `AppRun` + `WEBKIT_DISABLE_DMABUF_RENDERER` / `WEBKIT_DISABLE_COMPOSITING_MODE` / `GDK_BACKEND=wayland` | still blank |
+
+No environment variable fixes it. The windowed reproduction is unambiguous: a
+titled 720x620 window with nothing inside it, the desktop readable straight
+through.
+
+So the same user-visible trap had two unrelated causes, one week's worth of
+distinct mechanism apart: the page not loading, and the page loading into a
+renderer that cannot paint. Fixing the first did nothing for the second, and
+there is no reason to believe a third does not exist.
+
+## The actual fix: stop fixing causes
+
+The overlay no longer gets to capture input on the strength of having been
+constructed. It is built **inert** -- `ignore_cursor_events(true)`, unfocused,
+not always-on-top -- and is promoted to a real overlay only when the page emits
+`tt://overlay-ready`, which it sends after two `requestAnimationFrame` ticks,
+i.e. only once a frame has genuinely been composited. No signal within
+`OVERLAY_READY_TIMEOUT_MS` (2.5s) and the windows are destroyed and the break
+degrades to a notification that says why.
+
+This is cause-agnostic. It covers the dev-URL bug, the EGL bug, and whatever
+the third one turns out to be, because it stops asking *why* the page failed
+and asks only whether it painted.
+
+### The deadlock that the obvious version walks into
+
+The first attempt created the window with `.visible(false)` and showed it on
+ready. That fails 100% of the time, including on healthy machines: an unmapped
+window never composites, so `requestAnimationFrame` never fires, so the page
+can never report that it painted. Caught only by testing the *success* path --
+the log read `overlay did not report a rendered frame` on a machine whose
+overlay had rendered perfectly minutes earlier. Inert-but-visible is what
+squares it: the window has to be on screen to prove itself, so make it
+harmless instead of hiding it.
+
+## Process failures worth naming
+
+1. **Verified the fix on a shape that could not exhibit the bug.** The three
+   flags removed to make testing safe were precisely the three that turn a
+   blank window into a trap, and the direct launch skipped the environment
+   where the failure lives.
+2. **Ran the broken build on the user's machine repeatedly while debugging**,
+   locking their session several times. The reproduction should have been
+   bounded by an external watchdog from the first run, not the fourth.
+3. **Shipped a kill switch that did not work.** It ran
+   `pkill -f 'lib/twentytwenty/usr/bin/twentytwenty'`, but `AppRun` execs the
+   binary with `argv[0]` of `twentytwenty`, so the pattern matched nothing.
+   The same wrong pattern was in the test harness cleanup, which is why an
+   instance survived and kept trapping the user between tests. `pkill -x
+   twentytwenty` is correct.
+4. **Told the user to escape via a TTY** without checking they knew their
+   account password. They did not. The escape hatch has to work for the person
+   who has it, which now means a compositor-level shortcut and an automatic
+   timeout, not a shell.
+
+The standing escape is now a KWin script (`~/.local/share/kwin/scripts/ttkillswitch`):
+`Ctrl+Alt+K` closes any TwentyTwenty window, and any such window still up after
+60 seconds is closed automatically. It lives in the compositor, which owns
+input and dispatches global shortcuts before any client sees them, so it cannot
+be blocked by the window it is removing -- unlike anything inside the app.

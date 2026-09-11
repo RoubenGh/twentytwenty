@@ -75,6 +75,14 @@ pub fn run() {
                 };
                 app::dispatch(&h, cmds);
             });
+            // The overlay page reports that it has painted. Until this
+            // arrives the overlay windows stay hidden and capture nothing;
+            // see the module docs in `overlay.rs` for why that ordering is
+            // load-bearing rather than cosmetic.
+            let hr = app.handle().clone();
+            app.listen_any("tt://overlay-ready", move |_| {
+                overlay::mark_ready(&hr);
+            });
             let h2 = app.handle().clone();
             app.listen_any("tt://skip", move |_| {
                 let cmds = {

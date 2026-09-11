@@ -5,7 +5,7 @@ eye strain: every 20 minutes of screen time, look at something 20 feet away
 for 20 seconds. It lives in the tray, does its counting, and gets out of the
 way otherwise.
 
-Downloads: [github.com/RoubenGh/twentytwenty/releases/tag/v0.1.1](https://github.com/RoubenGh/twentytwenty/releases/tag/v0.1.1)
+Downloads: [github.com/RoubenGh/twentytwenty/releases/latest](https://github.com/RoubenGh/twentytwenty/releases/latest)
 
 ## Why this is not a plain 20-minute timer
 
@@ -89,17 +89,37 @@ past it.
 
 ### Linux
 
-Download from the [release page](https://github.com/RoubenGh/twentytwenty/releases/tag/v0.1.1):
+Download from the [latest release](https://github.com/RoubenGh/twentytwenty/releases/latest):
 
-- `.deb` (Debian/Ubuntu): `sudo dpkg -i TwentyTwenty_0.1.1_amd64.deb`
-- `.rpm` (Fedora/openSUSE): `sudo rpm -i TwentyTwenty-0.1.1-1.x86_64.rpm`
-- `.AppImage` (any distro): `chmod +x TwentyTwenty_0.1.1_amd64.AppImage && ./TwentyTwenty_0.1.1_amd64.AppImage`
+- `.deb` (Debian/Ubuntu): `sudo dpkg -i TwentyTwenty_*_amd64.deb`
+- `.rpm` (Fedora/openSUSE): `sudo rpm -i TwentyTwenty-*.x86_64.rpm`
+- `.AppImage` (any distro): `chmod +x TwentyTwenty_*_amd64.AppImage && ./TwentyTwenty_*_amd64.AppImage`
 
 No bypass is needed on Linux.
 
+**Prefer the `.deb` or `.rpm` if one fits your distro.** The AppImage carries
+its own copy of GTK and the EGL/GL stack, and on some systems those disagree
+with the host graphics driver badly enough that WebKit cannot create a
+rendering context at all:
+
+```
+Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...
+```
+
+The app handles this safely rather than breaking: an overlay that cannot draw
+is torn down within 2.5 seconds and the break arrives as a desktop
+notification instead, which says so explicitly. Nothing gets stuck on screen.
+But you lose the full-screen reminder, which is most of the point, so use a
+native package where you can.
+
+Confirmed on Arch (CachyOS, Mesa, KDE Plasma 6.7 Wayland), where the same
+binary run directly renders perfectly and only the AppImage-wrapped launch
+fails. On a distro with no native package, building from source (below) gives
+you a binary with no bundled libraries and no such conflict.
+
 ### Windows
 
-Download `TwentyTwenty_0.1.1_x64-setup.exe` (or `TwentyTwenty_0.1.1_x64_en-US.msi`) and run it.
+Download `TwentyTwenty_*_x64-setup.exe` (or `TwentyTwenty_*_x64_en-US.msi`) and run it.
 Windows SmartScreen will say "Windows protected your PC." Click **More
 info**, then **Run anyway**. This appears because the installer isn't signed
 with a paid Microsoft code-signing certificate, not because of anything
@@ -110,7 +130,7 @@ Verification status below before relying on it.
 
 ### macOS
 
-Download `TwentyTwenty_0.1.1_universal.dmg`, open it, and drag TwentyTwenty
+Download `TwentyTwenty_*_universal.dmg`, open it, and drag TwentyTwenty
 to Applications. Gatekeeper will refuse to open it ("cannot be opened
 because the developer cannot be verified"). Clear the quarantine flag from
 a terminal:
