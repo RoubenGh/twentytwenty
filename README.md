@@ -134,13 +134,24 @@ on purpose.
 against a live KDE Plasma 6.7.4 / Wayland session (see
 `docs/findings/2026-09-10-linux-sensing.md`), including a real 89-second
 passive-video-viewing test that confirmed the "watching counts as screen
-time" behavior actually works. The fullscreen multi-window overlay
+time" behavior actually works. The fullscreen overlay
 (`docs/findings/2026-09-10-wayland-overlay.md`) was likewise spike-tested and
-then confirmed end to end by a human on that same machine: overlay appears,
-stays on top, typing holds the countdown, it completes and auto-closes,
-Escape and Skip both dismiss it, and Quit from the tray actually exits the
-process. Lock detection was observed transitioning from `false` to `true` on
-a real lock event on this machine.
+then confirmed end to end by a human on that same machine, on its **single
+built-in display**, which is the only display configuration this project has
+ever run on: overlay appears, typing holds the countdown, it completes and
+auto-closes, Escape and Skip both dismiss it, and Quit from the tray actually
+exits the process. Lock detection was observed transitioning from `false` to
+`true` on a real lock event on this machine.
+
+Two things are deliberately **not** in that confirmed list, though earlier
+drafts of this section claimed them. Whether the overlay reliably stays above
+other windows is unresolved: the observation that seemed to settle it was made
+against the round-1 spike window rather than the window this app actually
+ships, and the introspection behind it turned out not to be trustworthy for
+this window (the findings doc explains why it was set aside). And the
+multi-window, one-overlay-per-monitor path has never been exercised by
+anything but code review, because a second monitor has never been attached to
+the test machine.
 
 **Windows and macOS: compile and pass their unit tests in CI, nothing more.**
 GitHub Actions builds and tests both platforms on every push, and the
@@ -154,17 +165,23 @@ is the first real-world test of that platform's sensing.
 
 ## Known limitations
 
-- **Background audio counts as screen time.** The Linux inhibition signal
-  KDE reports for a playing video is indistinguishable from the one it
-  reports for background music: both were observed carrying the identical
-  policy bitmask, and during the actual passing video test, the only reason
-  string present the whole time was `"Playing audio"`, not anything
-  video-specific. Two candidate filters (the bitmask, and the reason string)
-  were both tested against real data and both failed to distinguish audio
-  from video, and filtering on either would have broken the passing
-  "watching a video counts" case. So leaving music or a podcast playing
-  while you walk away will keep the counter running. This is a deliberate,
-  evidence-based tradeoff, not an oversight.
+- **Anything holding the display awake counts as screen time, whether or not
+  you're there.** The app counts *any* active PowerDevil inhibition, of any
+  category, from any application: a playing video, yes, but equally
+  background music, a long `pacman`/`apt` transaction, a big file copy, a
+  running VM, a download manager, an installer. Walk away while any of those
+  is running and the screen-time counter keeps going without you. The
+  narrower version of this ("background audio") is just the case that came
+  up first. No filtering is applied on purpose: the inhibition KDE reports
+  for a playing video is indistinguishable from the one it reports for
+  background music (both were observed carrying the identical policy
+  bitmask, and during the actual passing video test the only reason string
+  present the whole time was `"Playing audio"`, nothing video-specific), so
+  both candidate filters were tested against real data, both failed, and
+  filtering on either would have broken the passing "watching a video
+  counts" case that is the entire point of the project. That tradeoff stands
+  and is evidence-based, not an oversight; the cost of it is simply wider
+  than one bullet about music implied.
 - **Multi-monitor placement is unverified.** The overlay creates one
   fullscreen window per connected monitor, but the only machine this project
   was developed and tested on has a single built-in display. The author
@@ -215,7 +232,14 @@ is the first real-world test of that platform's sensing.
   (the fade-in is a pure CSS animation with no script dependency) and still
   closes itself automatically when the break timer completes, so it can
   never trap you indefinitely, but the Escape and Skip shortcuts won't work
-  for that particular break, since both are wired up in JavaScript.
+  for that particular break, since both are wired up in JavaScript. The
+  "never indefinitely" half of that is load-bearing enough to be enforced by
+  a test: closing the overlay is the Rust engine's job, not the page's, and
+  `every_user_event_that_ends_a_break_hides_the_overlay` walks every tray
+  action and asserts that any of them which ends a break also takes the
+  overlay down with it. Before v0.1.1 that was not actually true of
+  "Resume," which left the window on screen while the engine went back to
+  counting.
 
 ## Development setup
 
@@ -266,9 +290,17 @@ The engine and probe-parsing tests are pure and run on any platform:
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-35 tests pass on all three platforms in CI (engine, probe-parsing, and, on
-Linux only, since they need a real session bus, two D-Bus integration
-tests).
+That command runs 42 tests, but CI does not: the accurate version is 40
+unit tests (engine, probe parsing, probe selection) that compile and pass
+on all three platforms, plus two D-Bus integration tests in
+`src-tauri/tests/linux_probe.rs` that CI never really runs. That file is
+`#![cfg(target_os = "linux")]`, so the Windows and macOS jobs compile it
+away and run 40. On the Linux job it compiles, but both tests check for
+`DBUS_SESSION_BUS_ADDRESS` and `WAYLAND_DISPLAY` and return early when
+either is missing, which is always the case on a headless GitHub runner:
+they report as passing without having touched D-Bus at all. The only place
+those two have ever genuinely talked to a session bus and a compositor is
+this project's development machine, where they do pass.
 
 Do not run `pnpm tauri dev` casually: it puts a real fullscreen overlay on
 top of whatever you're doing the moment a break interval elapses. If you
