@@ -1,6 +1,6 @@
 [package]
 name = "twentytwenty"
-version = "0.1.1"
+version = "0.1.2"
 description = "Enforces the 20-20-20 rule by measuring real screen time, not wall-clock time"
 authors = ["Rouben Ghambaryan <roubenrg@gmail.com>"]
 edition = "2021"
